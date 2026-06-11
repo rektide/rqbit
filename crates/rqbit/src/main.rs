@@ -17,8 +17,8 @@ use clap_complete::Shell;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ConnectionOptions,
     CreateTorrentOptions, DhtSessionConfig, ListOnlyResponse, ListenerMode, ListenerOptions,
-    PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
-    check_torrent,
+    PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig, TorrentStats,
+    TorrentStatsState, check_torrent,
     dht::DhtPersistenceConfig,
     http_api::{HttpApi, HttpApiOptions},
     librqbit_spawn,
@@ -412,6 +412,33 @@ struct CompletionsOpts {
 }
 
 #[derive(Parser)]
+struct ResumeOpts {
+    /// The filename or URL of the torrent. If URL, http/https/magnet are supported.
+    torrent_path: Vec<String>,
+
+    /// The output folder where the torrent data is expected. Defaults to current folder.
+    /// This is the parent directory; multi-file torrents create a subfolder automatically.
+    #[arg(short = 'o', long)]
+    output_folder: Option<String>,
+
+    /// The sub folder within output folder. Same meaning as in "download".
+    #[arg(short = 's', long)]
+    sub_folder: Option<String>,
+
+    /// Only download files matching this regex (same as "download -r").
+    #[arg(short = 'r', long = "filename-re")]
+    only_files_matching_regex: Option<String>,
+
+    /// A comma-separated list of initial peers
+    #[arg(long = "initial-peers", value_parser = parse_initial_peers)]
+    initial_peers: Option<SocketAddrList>,
+
+    /// Disable HTTP API entirely.
+    #[arg(long = "disable-http-api")]
+    disable_http_api: bool,
+}
+
+#[derive(Parser)]
 struct ShareOpts {
     /// The path to create and share a torrent from
     path: String,
@@ -436,6 +463,10 @@ enum SubCommand {
     /// Verify data on disk against the torrent's piece hashes and report % downloaded.
     /// Stateless and read-only: doesn't create, write or resize any files.
     Check(CheckOpts),
+    /// Hash-check existing data and resume downloading missing pieces.
+    /// Always exits when done (unlike "server start").
+    /// To inspect without touching disk, use "rqbit check".
+    Resume(ResumeOpts),
     /// Shell completions. eval "$(rqbit completions bash)"
     Completions(CompletionsOpts),
 }
@@ -1083,6 +1114,136 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             }
             Ok(())
         }
+        SubCommand::Resume(resume_opts) => {
+            if resume_opts.torrent_path.is_empty() {
+                anyhow::bail!("you must provide at least one torrent to resume")
+            }
+
+            if let Some(ref mut dht) = sopts.dht {
+                dht.persistence = None;
+            }
+            sopts.persistence = None;
+
+            if let Some(l) = sopts.listen.as_mut() {
+                l.enable_upnp_port_forwarding = false;
+            }
+
+            let session = Session::new_with_opts(
+                resume_opts
+                    .output_folder
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .unwrap_or_default(),
+                sopts,
+            )
+            .await
+            .context("error initializing rqbit session")?;
+
+            librqbit_spawn(
+                trace_span!("stats_printer"),
+                "stats_printer",
+                stats_printer(session.clone()),
+            );
+
+            if !resume_opts.disable_http_api {
+                let http_api_fut = start_http_api(
+                    cancel.clone(),
+                    session.clone(),
+                    opts.http_api_listen_addr
+                        .unwrap_or((Ipv4Addr::LOCALHOST, 0).into()),
+                    http_api_opts,
+                    &opts,
+                    log_config,
+                )
+                .await?;
+                librqbit_spawn(debug_span!("http_api"), "http_api", http_api_fut);
+            }
+
+            let mut incomplete = Vec::new();
+            let mut failed = false;
+
+            for path in &resume_opts.torrent_path {
+                let handle = match session
+                    .add_torrent(
+                        AddTorrent::from_cli_argument(path)?,
+                        Some(AddTorrentOptions {
+                            paused: true,
+                            overwrite: true,
+                            only_files_regex: resume_opts.only_files_matching_regex.clone(),
+                            sub_folder: resume_opts.sub_folder.clone(),
+                            initial_peers: resume_opts
+                                .initial_peers
+                                .as_ref()
+                                .map(|p| &p.0)
+                                .cloned(),
+                            disable_trackers: opts.disable_trackers,
+                            force_tracker_interval: opts.force_tracker_interval,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                {
+                    Ok(AddTorrentResponse::Added(_, h)) => h,
+                    Ok(AddTorrentResponse::AlreadyManaged(_, h)) => {
+                        warn!(
+                            "torrent {:?} is already managed (duplicate argument?), skipping",
+                            h.info_hash()
+                        );
+                        continue;
+                    }
+                    Ok(_) => {
+                        error!("bug: unexpected response type for {path:?}");
+                        failed = true;
+                        continue;
+                    }
+                    Err(err) => {
+                        error!("error adding {path:?}: {err:#}");
+                        failed = true;
+                        continue;
+                    }
+                };
+
+                if let Err(e) = handle.wait_until_initialized().await {
+                    error!("error initializing {path:?}: {e:#}");
+                    failed = true;
+                    continue;
+                }
+
+                let stats = handle.stats();
+                print_resume_report(&handle, &stats);
+
+                if stats.finished {
+                    info!("{path:?}: already complete");
+                    continue;
+                }
+
+                session.unpause(&handle).await?;
+                incomplete.push(handle);
+            }
+
+            if incomplete.is_empty() {
+                if failed {
+                    anyhow::bail!("no torrents were resumed, some failed")
+                }
+                info!("all torrents already complete");
+                return Ok(());
+            }
+
+            let results = tokio::select! {
+                _ = cancel.cancelled() => {
+                    bail!("cancelled");
+                }
+                r = futures::future::join_all(
+                    incomplete.iter().map(|h| h.wait_until_completed())
+                ) => r
+            };
+
+            if results.iter().any(|r| r.is_err()) {
+                anyhow::bail!("some downloads failed")
+            }
+            info!("all downloads completed");
+            Ok(())
+        }
         SubCommand::Share(share_opts) => {
             if share_opts.path.is_empty() {
                 anyhow::bail!("you must provide a path to share")
@@ -1224,6 +1385,59 @@ async fn start_http_api(
         };
         res.context("error running server")
     })
+}
+
+fn print_resume_report(handle: &librqbit::ManagedTorrent, stats: &TorrentStats) {
+    let (name, info_hash, file_infos) = handle
+        .with_metadata(|m| {
+            let name = m.info.name().map(|n| n.into_owned()).unwrap_or_default();
+            let info_hash = handle.info_hash().as_string();
+            let infos = m.file_infos.clone();
+            (name, info_hash, infos)
+        })
+        .unwrap_or_else(|_| {
+            let info_hash = handle.info_hash().as_string();
+            (String::new(), info_hash, Vec::new())
+        });
+
+    println!("Torrent: {name} ({info_hash})");
+
+    let file_progress = &stats.file_progress;
+    for (i, fi) in file_infos.iter().enumerate() {
+        if fi.attrs.padding {
+            continue;
+        }
+        let have = file_progress.get(i).copied().unwrap_or(0);
+        let total = fi.len;
+        let pct = if total > 0 {
+            (have as f64 / total as f64) * 100.0
+        } else {
+            100.0
+        };
+        println!(
+            "  {:>6.2}%  {} ({} / {})",
+            pct,
+            fi.relative_filename.display(),
+            SF::new(have),
+            SF::new(total),
+        );
+    }
+
+    let have = stats.progress_bytes;
+    let total = stats.total_bytes;
+    let remaining = total.saturating_sub(have);
+    let pct = if total > 0 {
+        (have as f64 / total as f64) * 100.0
+    } else {
+        100.0
+    };
+    println!(
+        "Resume: have {} ({:.2}%), downloading {} of {}",
+        SF::new(have),
+        pct,
+        SF::new(remaining),
+        SF::new(total),
+    );
 }
 
 async fn stats_printer(session: Arc<Session>) -> Result<(), &'static str> {
