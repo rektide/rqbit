@@ -4,7 +4,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroU32,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -15,6 +18,7 @@ use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ConnectionOptions,
     CreateTorrentOptions, DhtSessionConfig, ListOnlyResponse, ListenerMode, ListenerOptions,
     PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
+    check_torrent,
     dht::DhtPersistenceConfig,
     http_api::{HttpApi, HttpApiOptions},
     librqbit_spawn,
@@ -380,6 +384,28 @@ fn parse_initial_peers(s: &str) -> anyhow::Result<SocketAddrList> {
 }
 
 #[derive(Parser)]
+struct CheckOpts {
+    /// The filename or URL of the torrent. If URL, http/https/magnet are supported.
+    torrent_path: Vec<String>,
+
+    /// The output folder where the torrent data is expected. Defaults to current folder.
+    #[arg(short = 'o', long)]
+    output_folder: Option<String>,
+
+    /// The sub folder within output folder. Same meaning as in "download".
+    #[arg(short = 's', long)]
+    sub_folder: Option<String>,
+
+    /// Print a per-piece map of verification results ('#' = verified, '.' = missing).
+    #[arg(short = 'p', long)]
+    pieces: bool,
+
+    /// A comma-separated list of initial peers, used for resolving magnet links.
+    #[arg(long = "initial-peers", value_parser = parse_initial_peers)]
+    initial_peers: Option<SocketAddrList>,
+}
+
+#[derive(Parser)]
 struct CompletionsOpts {
     /// The shell to generate completions for
     shell: Shell,
@@ -407,6 +433,9 @@ enum SubCommand {
     Share(ShareOpts),
     /// Download a single torrent, stateless.
     Download(DownloadOpts),
+    /// Verify data on disk against the torrent's piece hashes and report % downloaded.
+    /// Stateless and read-only: doesn't create, write or resize any files.
+    Check(CheckOpts),
     /// Shell completions. eval "$(rqbit completions bash)"
     Completions(CompletionsOpts),
 }
@@ -896,6 +925,163 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             } else {
                 anyhow::bail!("no torrents were added")
             }
+        }
+        SubCommand::Check(check_opts) => {
+            if check_opts.torrent_path.is_empty() {
+                anyhow::bail!("you must provide at least one torrent to check")
+            }
+
+            // "rqbit check" is ephemeral and read-only, so disable all persistence.
+            if let Some(ref mut dht) = sopts.dht {
+                dht.persistence = None;
+            }
+            sopts.persistence = None;
+            // We never download or upload anything, no point listening.
+            sopts.listen = None;
+
+            // DHT is only needed to resolve magnet links to metadata.
+            if !check_opts
+                .torrent_path
+                .iter()
+                .any(|p| p.starts_with("magnet:"))
+            {
+                sopts.dht = None;
+            }
+
+            let session = Session::new_with_opts(
+                check_opts
+                    .output_folder
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .unwrap_or_default(),
+                sopts,
+            )
+            .await
+            .context("error initializing rqbit session")?;
+
+            let mut failed = false;
+            for path in &check_opts.torrent_path {
+                let resp = match session
+                    .add_torrent(
+                        AddTorrent::from_cli_argument(path)?,
+                        Some(AddTorrentOptions {
+                            list_only: true,
+                            sub_folder: check_opts.sub_folder.clone(),
+                            initial_peers: check_opts.initial_peers.as_ref().map(|p| &p.0).cloned(),
+                            disable_trackers: opts.disable_trackers,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                {
+                    Ok(AddTorrentResponse::ListOnly(resp)) => resp,
+                    Ok(_) => {
+                        error!("bug: expected list-only response for {path:?}");
+                        failed = true;
+                        continue;
+                    }
+                    Err(err) => {
+                        error!("error reading torrent metadata for {path:?}: {err:#}");
+                        failed = true;
+                        continue;
+                    }
+                };
+
+                let name = resp
+                    .info
+                    .name()
+                    .map(|n| n.into_owned())
+                    .unwrap_or_else(|| path.clone());
+                let info_hash = resp.info_hash.as_string();
+                let output_folder = resp.output_folder;
+                let total_bytes = resp.info.lengths().total_length();
+
+                info!("checking {name:?} in {output_folder:?}");
+
+                let progress = Arc::new(AtomicU64::new(0));
+                let progress_printer = {
+                    let progress = progress.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            let checked = progress.load(Ordering::Relaxed);
+                            info!(
+                                "checked {:.2}% ({} / {})",
+                                checked as f64 * 100. / total_bytes.max(1) as f64,
+                                SF::new(checked),
+                                SF::new(total_bytes)
+                            );
+                        }
+                    })
+                };
+
+                let result = {
+                    let info = resp.info;
+                    let output_folder = output_folder.clone();
+                    let progress = progress.clone();
+                    tokio::task::spawn_blocking(move || {
+                        check_torrent(&info, &output_folder, &progress)
+                    })
+                    .await?
+                };
+                progress_printer.abort();
+
+                let result = match result {
+                    Ok(r) => r,
+                    Err(err) => {
+                        error!("error checking {path:?}: {err:#}");
+                        failed = true;
+                        continue;
+                    }
+                };
+
+                println!("Torrent: {name} ({info_hash})");
+                println!("Output folder: {}", output_folder.display());
+                println!("Files:");
+                for f in result.files.iter().filter(|f| !f.padding) {
+                    println!(
+                        "  {:>6.2}%  {} ({} / {}, pieces {} / {}{})",
+                        f.progress_percent(),
+                        f.relative_filename.display(),
+                        SF::new(f.have_bytes),
+                        SF::new(f.len),
+                        f.pieces_have,
+                        f.total_pieces(),
+                        if f.found_on_disk {
+                            ""
+                        } else {
+                            ", not found on disk"
+                        },
+                    );
+                }
+                if check_opts.pieces {
+                    const PIECES_PER_ROW: usize = 64;
+                    println!(
+                        "Piece map ('#' = verified, '.' = missing), {} pieces:",
+                        result.total_pieces
+                    );
+                    for (row, chunk) in result.have_pieces.chunks(PIECES_PER_ROW).enumerate() {
+                        let line: String = chunk
+                            .iter()
+                            .map(|have| if *have { '#' } else { '.' })
+                            .collect();
+                        println!("{:>10}  {}", row * PIECES_PER_ROW, line);
+                    }
+                }
+                println!(
+                    "Total: {:.2}% ({} / {}), pieces {} / {}",
+                    result.progress_percent(),
+                    SF::new(result.have_bytes),
+                    SF::new(result.total_bytes),
+                    result.have_piece_count,
+                    result.total_pieces
+                );
+            }
+
+            if failed {
+                anyhow::bail!("some checks failed")
+            }
+            Ok(())
         }
         SubCommand::Share(share_opts) => {
             if share_opts.path.is_empty() {
