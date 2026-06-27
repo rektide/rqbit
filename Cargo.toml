@@ -124,6 +124,7 @@ openssl = "0.10"
 parking_lot = "0.12"
 parse_duration = "2"
 pollster = "0.4"
+postcard = { version = "1", features = ["alloc"] }
 quick-xml = "0.38"
 rand = "0.9"
 regex = "1"

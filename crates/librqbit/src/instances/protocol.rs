@@ -1,33 +1,210 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::SocketAddr;
 
 use anyhow::{Context, bail};
+#[cfg(not(feature = "postcard-rpc"))]
 use byteorder::{BE, ByteOrder};
+use serde::{Deserialize, Serialize};
 
 pub(crate) const MODE_CONTROL: u8 = 0x01;
 pub(crate) const MODE_FORWARD_TCP: u8 = 0x02;
 
+#[cfg(not(feature = "postcard-rpc"))]
 pub(crate) const MSG_HELLO: u8 = 0x01;
+#[cfg(not(feature = "postcard-rpc"))]
 pub(crate) const MSG_TORRENTS_ADDED: u8 = 0x02;
+#[cfg(not(feature = "postcard-rpc"))]
 pub(crate) const MSG_TORRENTS_REMOVED: u8 = 0x03;
+#[cfg(not(feature = "postcard-rpc"))]
 pub(crate) const MSG_WHO_HAS: u8 = 0x04;
+#[cfg(not(feature = "postcard-rpc"))]
 pub(crate) const MSG_I_HAS: u8 = 0x05;
+#[cfg(not(feature = "postcard-rpc"))]
 pub(crate) const MSG_GOODBYE: u8 = 0x06;
 
-#[allow(dead_code)]
-pub(crate) const FRAME_LEN_SIZE: usize = 4;
-#[allow(dead_code)]
-pub(crate) const MSG_TYPE_SIZE: usize = 1;
+// ---------------------------------------------------------------------------
+// Typed message definitions (always compiled, format-agnostic)
+// ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum ControlMessage {
+    Hello { instance_id: String },
+    TorrentsAdded { info_hashes: Vec<[u8; 20]> },
+    TorrentsRemoved { info_hashes: Vec<[u8; 20]> },
+    WhoHas { info_hash: [u8; 20] },
+    IHas { info_hash: [u8; 20] },
+    Goodbye,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ForwardTcpMeta {
+    pub peer_addr: SocketAddr,
+    pub handshake: Vec<u8>,
+    pub extra: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// Framing helpers (format-agnostic)
+// ---------------------------------------------------------------------------
+
+/// Write a length-prefixed payload frame into `buf`.
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn write_frame(buf: &mut Vec<u8>, msg_type: u8, payload: &[u8]) {
-    let frame_len = (MSG_TYPE_SIZE + payload.len()) as u32;
-    buf.extend_from_slice(&frame_len.to_be_bytes());
-    buf.push(msg_type);
+pub(crate) fn write_payload_frame(buf: &mut Vec<u8>, payload: &[u8]) {
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     buf.extend_from_slice(payload);
 }
 
+// ---------------------------------------------------------------------------
+// Control message encode/decode (cfg-gated: postcard vs manual)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "postcard-rpc")]
+pub(crate) fn encode_control(msg: &ControlMessage) -> Vec<u8> {
+    postcard::to_allocvec(msg).expect("postcard serialization infallible for these types")
+}
+
+#[cfg(feature = "postcard-rpc")]
+pub(crate) fn decode_control(buf: &[u8]) -> anyhow::Result<ControlMessage> {
+    postcard::from_bytes(buf).context("postcard decode error")
+}
+
+#[cfg(not(feature = "postcard-rpc"))]
+pub(crate) fn encode_control(msg: &ControlMessage) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let (msg_type, payload) = match msg {
+        ControlMessage::Hello { instance_id } => (MSG_HELLO, encode_hello(instance_id)),
+        ControlMessage::TorrentsAdded { info_hashes } => {
+            let refs: Vec<&[u8; 20]> = info_hashes.iter().collect();
+            (MSG_TORRENTS_ADDED, encode_torrents(&refs))
+        }
+        ControlMessage::TorrentsRemoved { info_hashes } => {
+            let refs: Vec<&[u8; 20]> = info_hashes.iter().collect();
+            (MSG_TORRENTS_REMOVED, encode_torrents(&refs))
+        }
+        ControlMessage::WhoHas { info_hash } => (MSG_WHO_HAS, info_hash.to_vec()),
+        ControlMessage::IHas { info_hash } => (MSG_I_HAS, info_hash.to_vec()),
+        ControlMessage::Goodbye => (MSG_GOODBYE, Vec::new()),
+    };
+    buf.push(msg_type);
+    buf.extend_from_slice(&payload);
+    buf
+}
+
+#[cfg(not(feature = "postcard-rpc"))]
+pub(crate) fn decode_control(buf: &[u8]) -> anyhow::Result<ControlMessage> {
+    if buf.is_empty() {
+        bail!("empty control payload");
+    }
+    let msg_type = buf[0];
+    let payload = &buf[1..];
+    match msg_type {
+        MSG_HELLO => {
+            let hello = decode_hello(payload)?;
+            Ok(ControlMessage::Hello {
+                instance_id: hello.instance_id,
+            })
+        }
+        MSG_TORRENTS_ADDED => Ok(ControlMessage::TorrentsAdded {
+            info_hashes: decode_torrents(payload)?,
+        }),
+        MSG_TORRENTS_REMOVED => Ok(ControlMessage::TorrentsRemoved {
+            info_hashes: decode_torrents(payload)?,
+        }),
+        MSG_WHO_HAS => Ok(ControlMessage::WhoHas {
+            info_hash: decode_single_info_hash(payload)?,
+        }),
+        MSG_I_HAS => Ok(ControlMessage::IHas {
+            info_hash: decode_single_info_hash(payload)?,
+        }),
+        MSG_GOODBYE => Ok(ControlMessage::Goodbye),
+        other => bail!("unknown message type {other}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Forward metadata encode/decode (cfg-gated: postcard vs manual)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "postcard-rpc")]
+pub(crate) fn encode_forward(meta: &ForwardTcpMeta) -> Vec<u8> {
+    postcard::to_allocvec(meta).expect("postcard serialization infallible for these types")
+}
+
+#[cfg(feature = "postcard-rpc")]
+pub(crate) fn decode_forward(buf: &[u8]) -> anyhow::Result<ForwardTcpMeta> {
+    postcard::from_bytes(buf).context("postcard decode error")
+}
+
+#[cfg(not(feature = "postcard-rpc"))]
+pub(crate) fn encode_forward(meta: &ForwardTcpMeta) -> Vec<u8> {
+    encode_forward_metadata(meta.peer_addr, &meta.handshake, &meta.extra)
+}
+
+#[cfg(not(feature = "postcard-rpc"))]
+pub(crate) fn decode_forward(buf: &[u8]) -> anyhow::Result<ForwardTcpMeta> {
+    // Manual format: [addr_len][addr][hs_len][hs][extra_len][extra]
+    let mut off = 0;
+    if buf.len() < 4 {
+        bail!("forward payload too short for addr length");
+    }
+    let addr_len = BE::read_u32(&buf[off..off + 4]) as usize;
+    off += 4;
+    if buf.len() < off + addr_len {
+        bail!("forward payload truncated at addr");
+    }
+    let peer_addr = decode_socket_addr(&buf[off..off + addr_len])?;
+    off += addr_len;
+
+    if buf.len() < off + 4 {
+        bail!("forward payload too short for handshake length");
+    }
+    let hs_len = BE::read_u32(&buf[off..off + 4]) as usize;
+    off += 4;
+    if buf.len() < off + hs_len {
+        bail!("forward payload truncated at handshake");
+    }
+    let handshake = buf[off..off + hs_len].to_vec();
+    off += hs_len;
+
+    if buf.len() < off + 4 {
+        bail!("forward payload too short for extra length");
+    }
+    let extra_len = BE::read_u32(&buf[off..off + 4]) as usize;
+    off += 4;
+    if buf.len() < off + extra_len {
+        bail!("forward payload truncated at extra");
+    }
+    let extra = buf[off..off + extra_len].to_vec();
+
+    Ok(ForwardTcpMeta {
+        peer_addr,
+        handshake,
+        extra,
+    })
+}
+
+/// Read a length-prefixed forward metadata blob from an async reader.
+pub(crate) async fn read_forward_metadata<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> anyhow::Result<ForwardTcpMeta> {
+    use tokio::io::AsyncReadExt;
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > 1024 * 1024 {
+        bail!("forward metadata too large: {len}");
+    }
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).await?;
+    decode_forward(&buf)
+}
+
+// ---------------------------------------------------------------------------
+// Manual encoding helpers (used only without postcard-rpc feature)
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "postcard-rpc"))]
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn encode_hello(instance_id: &str) -> Vec<u8> {
+fn encode_hello(instance_id: &str) -> Vec<u8> {
     let id_bytes = instance_id.as_bytes();
     let mut payload = Vec::with_capacity(2 + id_bytes.len());
     BE::write_u16(&mut payload, id_bytes.len() as u16);
@@ -35,11 +212,13 @@ pub(crate) fn encode_hello(instance_id: &str) -> Vec<u8> {
     payload
 }
 
-pub(crate) struct DecodedHello {
-    pub instance_id: String,
+#[cfg(not(feature = "postcard-rpc"))]
+struct DecodedHello {
+    instance_id: String,
 }
 
-pub(crate) fn decode_hello(buf: &[u8]) -> anyhow::Result<DecodedHello> {
+#[cfg(not(feature = "postcard-rpc"))]
+fn decode_hello(buf: &[u8]) -> anyhow::Result<DecodedHello> {
     if buf.len() < 2 {
         bail!("hello payload too short");
     }
@@ -53,8 +232,9 @@ pub(crate) fn decode_hello(buf: &[u8]) -> anyhow::Result<DecodedHello> {
     Ok(DecodedHello { instance_id })
 }
 
+#[cfg(not(feature = "postcard-rpc"))]
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn encode_torrents(info_hashes: &[&[u8; 20]]) -> Vec<u8> {
+fn encode_torrents(info_hashes: &[&[u8; 20]]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(2 + info_hashes.len() * 20);
     BE::write_u16(&mut payload, info_hashes.len() as u16);
     for ih in info_hashes {
@@ -63,19 +243,8 @@ pub(crate) fn encode_torrents(info_hashes: &[&[u8; 20]]) -> Vec<u8> {
     payload
 }
 
-pub(crate) fn encode_single_info_hash(info_hash: &[u8; 20]) -> Vec<u8> {
-    info_hash.to_vec()
-}
-
-#[allow(dead_code)]
-pub(crate) fn decode_msg_type(buf: &[u8]) -> anyhow::Result<u8> {
-    if buf.is_empty() {
-        bail!("empty message");
-    }
-    Ok(buf[0])
-}
-
-pub(crate) fn decode_torrents(buf: &[u8]) -> anyhow::Result<Vec<[u8; 20]>> {
+#[cfg(not(feature = "postcard-rpc"))]
+fn decode_torrents(buf: &[u8]) -> anyhow::Result<Vec<[u8; 20]>> {
     if buf.len() < 2 {
         bail!("torrents payload too short");
     }
@@ -94,7 +263,8 @@ pub(crate) fn decode_torrents(buf: &[u8]) -> anyhow::Result<Vec<[u8; 20]>> {
     Ok(out)
 }
 
-pub(crate) fn decode_single_info_hash(buf: &[u8]) -> anyhow::Result<[u8; 20]> {
+#[cfg(not(feature = "postcard-rpc"))]
+fn decode_single_info_hash(buf: &[u8]) -> anyhow::Result<[u8; 20]> {
     if buf.len() < 20 {
         bail!("info hash payload too short");
     }
@@ -103,7 +273,22 @@ pub(crate) fn decode_single_info_hash(buf: &[u8]) -> anyhow::Result<[u8; 20]> {
     Ok(ih)
 }
 
-pub(crate) fn encode_socket_addr(addr: SocketAddr) -> Vec<u8> {
+#[cfg(not(feature = "postcard-rpc"))]
+#[allow(clippy::cast_possible_truncation)]
+fn encode_forward_metadata(peer_addr: SocketAddr, handshake: &[u8], extra: &[u8]) -> Vec<u8> {
+    let addr_bytes = encode_socket_addr(peer_addr);
+    let mut buf = Vec::with_capacity(4 + addr_bytes.len() + 4 + handshake.len() + 4 + extra.len());
+    buf.extend_from_slice(&(addr_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&addr_bytes);
+    buf.extend_from_slice(&(handshake.len() as u32).to_be_bytes());
+    buf.extend_from_slice(handshake);
+    buf.extend_from_slice(&(extra.len() as u32).to_be_bytes());
+    buf.extend_from_slice(extra);
+    buf
+}
+
+#[cfg(not(feature = "postcard-rpc"))]
+fn encode_socket_addr(addr: SocketAddr) -> Vec<u8> {
     match addr {
         SocketAddr::V4(v4) => {
             let mut buf = Vec::with_capacity(1 + 4 + 2);
@@ -124,7 +309,9 @@ pub(crate) fn encode_socket_addr(addr: SocketAddr) -> Vec<u8> {
     }
 }
 
-pub(crate) fn decode_socket_addr(buf: &[u8]) -> anyhow::Result<SocketAddr> {
+#[cfg(not(feature = "postcard-rpc"))]
+fn decode_socket_addr(buf: &[u8]) -> anyhow::Result<SocketAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     if buf.is_empty() {
         bail!("empty socket addr");
     }
@@ -156,71 +343,5 @@ pub(crate) fn decode_socket_addr(buf: &[u8]) -> anyhow::Result<SocketAddr> {
             )))
         }
         other => bail!("unknown address family {other}"),
-    }
-}
-
-#[allow(clippy::cast_possible_truncation)]
-pub(crate) fn encode_forward_metadata(
-    peer_addr: SocketAddr,
-    handshake: &[u8],
-    extra: &[u8],
-) -> Vec<u8> {
-    let addr_bytes = encode_socket_addr(peer_addr);
-    let mut buf = Vec::with_capacity(4 + addr_bytes.len() + 4 + handshake.len() + 4 + extra.len());
-    buf.extend_from_slice(&(addr_bytes.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&addr_bytes);
-    buf.extend_from_slice(&(handshake.len() as u32).to_be_bytes());
-    buf.extend_from_slice(handshake);
-    buf.extend_from_slice(&(extra.len() as u32).to_be_bytes());
-    buf.extend_from_slice(extra);
-    buf
-}
-
-pub(crate) struct ForwardMetadata {
-    pub peer_addr: SocketAddr,
-    pub handshake: Vec<u8>,
-    pub extra: Vec<u8>,
-}
-
-pub(crate) async fn read_forward_metadata<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut R,
-) -> anyhow::Result<ForwardMetadata> {
-    use tokio::io::AsyncReadExt;
-    async fn read_u32_be<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> anyhow::Result<u32> {
-        let mut buf = [0u8; 4];
-        r.read_exact(&mut buf).await.context("reading u32")?;
-        Ok(u32::from_be_bytes(buf))
-    }
-    async fn read_blob<R: tokio::io::AsyncRead + Unpin>(
-        r: &mut R,
-        len: usize,
-    ) -> anyhow::Result<Vec<u8>> {
-        let mut buf = vec![0u8; len];
-        r.read_exact(&mut buf).await.context("reading blob")?;
-        Ok(buf)
-    }
-
-    let addr_len = read_u32_be(reader).await? as usize;
-    let addr_bytes = read_blob(reader, addr_len).await?;
-    let peer_addr = decode_socket_addr(&addr_bytes)?;
-
-    let hs_len = read_u32_be(reader).await? as usize;
-    let handshake = read_blob(reader, hs_len).await?;
-
-    let extra_len = read_u32_be(reader).await? as usize;
-    let extra = read_blob(reader, extra_len).await?;
-
-    Ok(ForwardMetadata {
-        peer_addr,
-        handshake,
-        extra,
-    })
-}
-
-#[allow(unused)]
-pub(crate) fn ip_addr_is_localhost(addr: &IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => v6.is_loopback(),
     }
 }

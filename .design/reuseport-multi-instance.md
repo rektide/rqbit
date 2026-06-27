@@ -161,61 +161,105 @@ InstanceCoordinator::shutdown()
 
 ### IPC Wire Protocol
 
-All communication is over Unix domain stream sockets. Binary,
-length-prefixed framing. No serde — manual encode/decode for minimal
-overhead and no format ambiguity.
+All communication is over Unix domain stream sockets. The protocol supports
+**two encoding formats** selected at compile time via cargo features:
+
+| Feature | Format | Default | Description |
+|---------|--------|---------|-------------|
+| (none) | Manual binary | Yes | Hand-rolled encode/decode, no msg_type byte overhead from serde |
+| `postcard-rpc` | Postcard (serde) | No | Type-safe `#[derive(Serialize, Deserialize)]` message enums, compact varint encoding |
+
+Both formats share the same **typed message definitions** — `ControlMessage`
+and `ForwardTcpMeta` enums/structs defined in `protocol.rs`. The encode/decode
+functions (`encode_control`, `decode_control`, `encode_forward`,
+`decode_forward`) are cfg-gated: postcard uses `postcard::to_allocvec` /
+`from_bytes`, while the manual path maps enum variants to tagged binary
+payloads.
+
+**Future**: `varlink` (JSON-based, language-agnostic IDL) will become the
+default. Auto-detection of postcard vs varlink on incoming connections
+(sslh-style first-byte peek) will allow mixed-format interop. See tickets
+`rqbit-reuseport-varlink` and `rqbit-reuseport-proto-detect`.
 
 #### Connection Modes
 
-First byte of every connection selects the mode:
+First byte of every connection selects the mode (format-agnostic):
 
 | Mode | Byte | Lifetime | Purpose |
 |------|------|----------|---------|
 | Control | `0x01` | Persistent | Bidirectional stream of framed control messages |
 | Forward TCP | `0x02` | One-shot | Forwarded BT connection: metadata + bidirectional pipe |
 
-#### Control Message Framing
+#### Framing
+
+All frames use the same length-prefix structure regardless of encoding format:
 
 ```
-[u32 BE: frame_len] [u8: msg_type] [payload...]
-
-frame_len = 1 + payload.len()
-Maximum frame size: 1 MiB
+[u32 BE: payload_len] [payload bytes]
 ```
 
-#### Control Message Types
+The payload content depends on the encoding format (see below). Maximum frame
+size: 1 MiB.
 
-| Type | Byte | Payload | Direction |
-|------|------|---------|-----------|
-| Hello | `0x01` | `[u16 BE: id_len][id UTF-8 bytes]` | Both sides send on connect |
-| TorrentsAdded | `0x02` | `[u16 BE: count][count × 20 bytes]` | Announce ownership |
-| TorrentsRemoved | `0x03` | `[u16 BE: count][count × 20 bytes]` | Revoke ownership |
-| WhoHas | `0x04` | `[20 bytes: info_hash]` | Query: "who has this torrent?" |
-| IHas | `0x05` | `[20 bytes: info_hash]` | Response: "I have it" |
-| Goodbye | `0x06` | (empty) | Graceful disconnect |
+#### Typed Messages
+
+Format-agnostic types defined in `protocol.rs`:
+
+```rust
+enum ControlMessage {
+    Hello { instance_id: String },
+    TorrentsAdded { info_hashes: Vec<[u8; 20]> },
+    TorrentsRemoved { info_hashes: Vec<[u8; 20]> },
+    WhoHas { info_hash: [u8; 20] },
+    IHas { info_hash: [u8; 20] },
+    Goodbye,
+}
+
+struct ForwardTcpMeta {
+    peer_addr: SocketAddr,
+    handshake: Vec<u8>,
+    extra: Vec<u8>,
+}
+```
+
+#### Manual Binary Format (default)
+
+Control message payload: `[u8: msg_type] [manual_payload]`
+
+| msg_type | Value | Payload |
+|----------|-------|---------|
+| Hello | `0x01` | `[u16 BE: id_len][id UTF-8]` |
+| TorrentsAdded | `0x02` | `[u16 BE: count][count × 20 bytes]` |
+| TorrentsRemoved | `0x03` | `[u16 BE: count][count × 20 bytes]` |
+| WhoHas | `0x04` | `[20 bytes]` |
+| IHas | `0x05` | `[20 bytes]` |
+| Goodbye | `0x06` | (empty) |
+
+Forward metadata payload: `[u32 BE: addr_len][addr][u32 BE: hs_len][hs][u32 BE: extra_len][extra]`
+
+SocketAddr manual encoding:
+- IPv4: `[1 byte: family=4][4 bytes: octets][2 bytes BE: port]`
+- IPv6: `[1 byte: family=6][16 bytes: octets][2 bytes BE: port][4 bytes BE: flowinfo][4 bytes BE: scope_id]`
+
+#### Postcard Format (`--features postcard-rpc`)
+
+Control message payload: `postcard::to_allocvec(&ControlMessage)`
+
+Postcard serializes the enum variant tag as a varint, followed by the variant
+fields. `[u8; 20]` serializes as 20 raw bytes. `String` as varint length + UTF-8.
+`Vec<[u8; 20]>` as varint count + concatenated 20-byte arrays. `SocketAddr`
+serializes natively via serde (no manual family byte needed).
+
+Forward metadata payload: `postcard::to_allocvec(&ForwardTcpMeta)`
+
+All within the same `[u32 BE: payload_len][payload]` frame. The mode byte and
+bidirectional pipe structure are identical to the manual format.
 
 #### Hello Exchange
 
 When two instances connect (either direction), both send Hello as the first
-control frame, followed by their current torrent list. This bootstraps the
-routing table. The connection initiator sends Hello immediately after the mode
-byte; the receiver responds with its own Hello.
-
-#### Forward TCP Metadata
-
-For forwarded connections, after the mode byte (`0x02`), the sender writes
-a metadata frame, then a bidirectional byte pipe:
-
-```
-[u32 BE: addr_len] [addr_bytes]
-[u32 BE: handshake_len] [handshake_bytes]   // always 68 bytes
-[u32 BE: extra_len] [extra_bytes]           // any bytes read after handshake
---- then raw bidirectional pipe ---
-```
-
-`addr_bytes` encodes `SocketAddr`:
-- IPv4: `[1 byte: family=4][4 bytes: octets][2 bytes BE: port]`
-- IPv6: `[1 byte: family=6][16 bytes: octets][2 bytes BE: port][4 bytes BE: flowinfo][4 bytes BE: scope_id]`
+control frame, followed by their current torrent list (as TorrentsAdded).
+This bootstraps the routing table.
 
 ### Routing Table
 

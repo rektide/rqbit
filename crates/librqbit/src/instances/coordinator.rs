@@ -12,8 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 use crate::instances::protocol::{
-    self, MODE_CONTROL, MODE_FORWARD_TCP, MSG_GOODBYE, MSG_HELLO, MSG_I_HAS, MSG_TORRENTS_ADDED,
-    MSG_TORRENTS_REMOVED, MSG_WHO_HAS,
+    self, ControlMessage, ForwardTcpMeta, MODE_CONTROL, MODE_FORWARD_TCP,
 };
 use crate::instances::routing::RoutingTable;
 use crate::instances::{ForwardHandler, InstanceId};
@@ -85,8 +84,9 @@ impl InstanceCoordinator {
 
     pub fn shutdown(&self) {
         self.cancellation.cancel();
-        let mut goodbye = Vec::new();
-        protocol::write_frame(&mut goodbye, MSG_GOODBYE, &[]);
+        let goodbye_payload = protocol::encode_control(&ControlMessage::Goodbye);
+        let mut frame = Vec::new();
+        protocol::write_payload_frame(&mut frame, &goodbye_payload);
         let senders: Vec<_> = self
             .peers
             .read()
@@ -94,7 +94,7 @@ impl InstanceCoordinator {
             .map(|p| p.sender.clone())
             .collect();
         for sender in senders {
-            let _ = sender.send(goodbye.clone());
+            let _ = sender.send(frame.clone());
         }
         let _ = std::fs::remove_file(&self.socket_path);
     }
@@ -199,19 +199,17 @@ impl InstanceCoordinator {
 
         let mut buf = Vec::new();
         buf.push(MODE_CONTROL);
-        protocol::write_frame(
-            &mut buf,
-            MSG_HELLO,
-            &protocol::encode_hello(&self.instance_id),
-        );
+        let hello_payload = protocol::encode_control(&ControlMessage::Hello {
+            instance_id: self.instance_id.clone(),
+        });
+        protocol::write_payload_frame(&mut buf, &hello_payload);
+
         let local_torrents = self.local_torrents.read().clone();
         if !local_torrents.is_empty() {
-            let refs: Vec<&[u8; 20]> = local_torrents.iter().collect();
-            protocol::write_frame(
-                &mut buf,
-                MSG_TORRENTS_ADDED,
-                &protocol::encode_torrents(&refs),
-            );
+            let added_payload = protocol::encode_control(&ControlMessage::TorrentsAdded {
+                info_hashes: local_torrents,
+            });
+            protocol::write_payload_frame(&mut buf, &added_payload);
         }
 
         stream.writable().await?;
@@ -299,7 +297,14 @@ impl InstanceCoordinator {
                         debug!(peer = %peer_id, error=%e, "error reading frame");
                         break;
                     }
-                    if let Err(e) = self.handle_control_message(&peer_id, frame[0], &frame[1..]).await {
+                    let msg = match protocol::decode_control(&frame) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            warn!(peer = %peer_id, error=%e, "error decoding control message");
+                            break;
+                        }
+                    };
+                    if let Err(e) = self.handle_control_message(&peer_id, msg).await {
                         warn!(peer = %peer_id, error=%e, "error handling control message");
                     }
                 }
@@ -321,59 +326,59 @@ impl InstanceCoordinator {
     async fn handle_control_message(
         &self,
         peer_id: &str,
-        msg_type: u8,
-        payload: &[u8],
+        msg: ControlMessage,
     ) -> anyhow::Result<()> {
-        match msg_type {
-            MSG_HELLO => {
-                let hello = protocol::decode_hello(payload)?;
-                debug!(peer = %peer_id, id = %hello.instance_id, "received Hello");
+        match &msg {
+            ControlMessage::Hello { instance_id } => {
+                debug!(peer = %peer_id, id = %instance_id, "received Hello");
             }
-            MSG_TORRENTS_ADDED => {
-                let torrents = protocol::decode_torrents(payload)?;
-                debug!(peer = %peer_id, count = torrents.len(), "torrents added");
-                self.routing.add_many(&torrents, &peer_id.to_string());
+            ControlMessage::TorrentsAdded { info_hashes } => {
+                debug!(peer = %peer_id, count = info_hashes.len(), "torrents added");
+                self.routing.add_many(info_hashes, &peer_id.to_string());
             }
-            MSG_TORRENTS_REMOVED => {
-                let torrents = protocol::decode_torrents(payload)?;
-                debug!(peer = %peer_id, count = torrents.len(), "torrents removed");
-                for ih in &torrents {
+            ControlMessage::TorrentsRemoved { info_hashes } => {
+                debug!(peer = %peer_id, count = info_hashes.len(), "torrents removed");
+                for ih in info_hashes {
                     self.routing.remove(ih, &peer_id.to_string());
                 }
             }
-            MSG_WHO_HAS => {
-                let ih = protocol::decode_single_info_hash(payload)?;
-                if self.local_torrents.read().contains(&ih) {
-                    self.send_to_peer(peer_id, MSG_I_HAS, &protocol::encode_single_info_hash(&ih))?;
+            ControlMessage::WhoHas { info_hash } => {
+                if self.local_torrents.read().contains(info_hash) {
+                    self.send_to_peer(
+                        peer_id,
+                        &ControlMessage::IHas {
+                            info_hash: *info_hash,
+                        },
+                    )?;
                 }
             }
-            MSG_I_HAS => {
-                let ih = protocol::decode_single_info_hash(payload)?;
-                self.routing.add(&ih, peer_id.to_string());
+            ControlMessage::IHas { info_hash } => {
+                self.routing.add(info_hash, peer_id.to_string());
             }
-            MSG_GOODBYE => {
+            ControlMessage::Goodbye => {
                 debug!(peer = %peer_id, "received Goodbye");
                 self.remove_peer(peer_id);
             }
-            other => warn!(msg_type = other, "unknown control message"),
         }
         Ok(())
     }
 
-    fn send_to_peer(&self, peer_id: &str, msg_type: u8, payload: &[u8]) -> anyhow::Result<()> {
+    fn send_to_peer(&self, peer_id: &str, msg: &ControlMessage) -> anyhow::Result<()> {
         let peers = self.peers.read();
         let peer = peers
             .get(peer_id)
             .with_context(|| format!("peer {peer_id} not connected"))?;
+        let payload = protocol::encode_control(msg);
         let mut frame = Vec::new();
-        protocol::write_frame(&mut frame, msg_type, payload);
+        protocol::write_payload_frame(&mut frame, &payload);
         peer.sender.send(frame)?;
         Ok(())
     }
 
-    fn broadcast(&self, msg_type: u8, payload: &[u8]) {
+    fn broadcast(&self, msg: &ControlMessage) {
+        let payload = protocol::encode_control(msg);
         let mut frame = Vec::new();
-        protocol::write_frame(&mut frame, msg_type, payload);
+        protocol::write_payload_frame(&mut frame, &payload);
         for peer in self.peers.read().values() {
             let _ = peer.sender.send(frame.clone());
         }
@@ -389,16 +394,17 @@ impl InstanceCoordinator {
     pub fn announce_torrent(&self, info_hash: &[u8; 20]) {
         self.local_torrents.write().push(*info_hash);
         self.routing.add(info_hash, self.instance_id.clone());
-        self.broadcast(MSG_TORRENTS_ADDED, &protocol::encode_torrents(&[info_hash]));
+        self.broadcast(&ControlMessage::TorrentsAdded {
+            info_hashes: vec![*info_hash],
+        });
     }
 
     pub fn unannounce_torrent(&self, info_hash: &[u8; 20]) {
         self.local_torrents.write().retain(|ih| ih != info_hash);
         self.routing.remove(info_hash, &self.instance_id);
-        self.broadcast(
-            MSG_TORRENTS_REMOVED,
-            &protocol::encode_torrents(&[info_hash]),
-        );
+        self.broadcast(&ControlMessage::TorrentsRemoved {
+            info_hashes: vec![*info_hash],
+        });
     }
 
     pub fn lookup(&self, info_hash: &[u8; 20]) -> Option<InstanceId> {
@@ -412,7 +418,9 @@ impl InstanceCoordinator {
         if let Some(id) = self.lookup(info_hash) {
             return Some(id);
         }
-        self.broadcast(MSG_WHO_HAS, &protocol::encode_single_info_hash(info_hash));
+        self.broadcast(&ControlMessage::WhoHas {
+            info_hash: *info_hash,
+        });
         None
     }
     async fn handle_incoming_connection(
@@ -447,26 +455,27 @@ impl InstanceCoordinator {
         }
         let mut frame = vec![0u8; frame_len];
         stream.read_exact(&mut frame).await?;
-        if frame[0] != MSG_HELLO {
-            bail!("expected Hello, got msg_type {}", frame[0]);
-        }
-        let hello = protocol::decode_hello(&frame[1..])?;
-        let peer_id = hello.instance_id;
+
+        let msg = protocol::decode_control(&frame)?;
+        let ControlMessage::Hello {
+            instance_id: peer_id,
+        } = msg
+        else {
+            bail!("expected Hello as first message");
+        };
 
         let mut hello_back = Vec::new();
-        protocol::write_frame(
-            &mut hello_back,
-            MSG_HELLO,
-            &protocol::encode_hello(&self.instance_id),
-        );
+        let hello_payload = protocol::encode_control(&ControlMessage::Hello {
+            instance_id: self.instance_id.clone(),
+        });
+        protocol::write_payload_frame(&mut hello_back, &hello_payload);
+
         let torrents = self.local_torrents.read().clone();
         if !torrents.is_empty() {
-            let refs: Vec<&[u8; 20]> = torrents.iter().collect();
-            protocol::write_frame(
-                &mut hello_back,
-                MSG_TORRENTS_ADDED,
-                &protocol::encode_torrents(&refs),
-            );
+            let added_payload = protocol::encode_control(&ControlMessage::TorrentsAdded {
+                info_hashes: torrents,
+            });
+            protocol::write_payload_frame(&mut hello_back, &added_payload);
         }
         stream.write_all(&hello_back).await?;
 
@@ -496,7 +505,7 @@ impl InstanceCoordinator {
 
     async fn handle_incoming_forward(self: Arc<Self>, stream: UnixStream) {
         let mut stream = stream;
-        let metadata = match protocol::read_forward_metadata(&mut stream).await {
+        let meta = match protocol::read_forward_metadata(&mut stream).await {
             Ok(m) => m,
             Err(e) => {
                 warn!(error=%e, "error reading forward metadata");
@@ -511,14 +520,14 @@ impl InstanceCoordinator {
         };
 
         debug!(
-            peer_addr = ?metadata.peer_addr,
-            hs_len = metadata.handshake.len(),
-            extra_len = metadata.extra.len(),
+            peer_addr = ?meta.peer_addr,
+            hs_len = meta.handshake.len(),
+            extra_len = meta.extra.len(),
             "received forwarded TCP connection"
         );
 
-        let mut prefix = metadata.handshake.clone();
-        prefix.extend_from_slice(&metadata.extra);
+        let mut prefix = meta.handshake.clone();
+        prefix.extend_from_slice(&meta.extra);
 
         let (read_half, write_half) = stream.into_split();
         let reader = PrefixedReader::new(prefix, read_half);
@@ -527,7 +536,7 @@ impl InstanceCoordinator {
         let boxed_writer: BoxAsyncWrite = Box::new(write_half);
 
         handler
-            .handle_forwarded(metadata.peer_addr, boxed_reader, boxed_writer)
+            .handle_forwarded(meta.peer_addr, boxed_reader, boxed_writer)
             .await;
     }
 
@@ -550,8 +559,16 @@ impl InstanceCoordinator {
 
         let mut stream = UnixStream::connect(&socket_path).await?;
         stream.write_all(&[MODE_FORWARD_TCP]).await?;
-        let metadata = protocol::encode_forward_metadata(peer_addr, handshake_bytes, extra_bytes);
-        stream.write_all(&metadata).await?;
+
+        let meta = ForwardTcpMeta {
+            peer_addr,
+            handshake: handshake_bytes.to_vec(),
+            extra: extra_bytes.to_vec(),
+        };
+        let meta_payload = protocol::encode_forward(&meta);
+        let mut meta_frame = Vec::new();
+        protocol::write_payload_frame(&mut meta_frame, &meta_payload);
+        stream.write_all(&meta_frame).await?;
 
         debug!(
             target_instance = instance_id,
