@@ -126,13 +126,43 @@ async fn forward_port(
         .await
         .context("error reading response text")?;
 
-    trace!(status = %status, text=response_text, "AddPortMapping response");
-    if !status.is_success() {
-        bail!("failed port forwarding: {}", status);
-    } else {
-        debug!(%local_ip, port, "successfully port forwarded");
+    trace!(status = %status, text=%response_text, "AddPortMapping response");
+
+    if let Some((code, desc)) = parse_upnp_error(&response_text) {
+        if code == 718 {
+            debug!(
+                %local_ip, port, code, %desc,
+                "port mapping already exists (ConflictInMappingEntry tolerated)"
+            );
+            return Ok(());
+        }
+        bail!("AddPortMapping SOAP error {code}: {desc}");
     }
+
+    if !status.is_success() {
+        bail!("failed port forwarding: HTTP {status}");
+    }
+
+    debug!(%local_ip, port, "successfully port forwarded");
     Ok(())
+}
+
+fn parse_upnp_error(body: &str) -> Option<(u32, String)> {
+    let start = body.find("<errorCode>")? + "<errorCode>".len();
+    let end = body[start..].find("</errorCode>")? + start;
+    let code: u32 = body[start..end].parse().ok()?;
+
+    let desc = body
+        .find("<errorDescription>")
+        .and_then(|s| {
+            let s = s + "<errorDescription>".len();
+            body[s..]
+                .find("</errorDescription>")
+                .map(|e| body[s..s + e].to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Some((code, desc))
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

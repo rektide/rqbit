@@ -782,10 +782,11 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             }
 
             if let Some(listen) = sopts.listen.as_mut() {
-                // We are creating an ephemeral download, no point in port forwarding.
-                listen.enable_upnp_port_forwarding = false;
                 if download_opts.reuseport {
                     listen.reuseport = true;
+                } else {
+                    // Ephemeral download, no point in port forwarding.
+                    listen.enable_upnp_port_forwarding = false;
                 }
             }
 
