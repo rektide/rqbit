@@ -362,6 +362,12 @@ struct DownloadOpts {
     /// Disable HTTP API entirely.
     #[arg(long = "disable-http-api")]
     disable_http_api: bool,
+
+    /// Enable SO_REUSEPORT on the TCP listener, allowing multiple rqbit instances
+    /// to share the same listen port. Incoming connections are routed to the correct
+    /// instance via IPC coordination.
+    #[arg(long = "reuseport", env = "RQBIT_REUSEPORT")]
+    reuseport: bool,
 }
 
 #[derive(Clone)]
@@ -666,6 +672,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         runtime_worker_threads: Some(opts.max_blocking_threads as usize),
         ipv4_only: opts.ipv4_only,
         client_name_and_version: None,
+        instance_coordinator: None,
     };
 
     #[allow(clippy::needless_update)]
@@ -777,6 +784,14 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             if let Some(listen) = sopts.listen.as_mut() {
                 // We are creating an ephemeral download, no point in port forwarding.
                 listen.enable_upnp_port_forwarding = false;
+                if download_opts.reuseport {
+                    listen.reuseport = true;
+                }
+            }
+
+            if download_opts.reuseport {
+                sopts.instance_coordinator =
+                    Some(librqbit::instances::InstanceCoordinator::start().await?);
             }
 
             let torrent_opts = || AddTorrentOptions {

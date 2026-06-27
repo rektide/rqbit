@@ -57,6 +57,7 @@ pub mod http_api;
 pub mod http_api_client;
 #[cfg(any(feature = "http-api", feature = "http-api-client"))]
 pub mod http_api_types;
+pub mod instances;
 mod ip_ranges;
 pub mod limits;
 mod listen;

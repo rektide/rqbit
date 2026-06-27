@@ -116,6 +116,17 @@ impl ReadBuf {
         advance!(self, len);
     }
 
+    /// Drain and return any remaining bytes in the buffer.
+    /// Used when forwarding a connection to another instance.
+    pub fn drain_remaining(&mut self) -> Vec<u8> {
+        let (first, second) = self.as_slice_ranges();
+        let mut result = Vec::with_capacity(self.len);
+        result.extend_from_slice(&self.buf[first]);
+        result.extend_from_slice(&self.buf[second]);
+        self.len = 0;
+        result
+    }
+
     fn is_full(&self) -> bool {
         self.len == BUFLEN
     }

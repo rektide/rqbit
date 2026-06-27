@@ -57,6 +57,7 @@ pub struct ListenerOptions {
     pub announce_port: Option<u16>,
     pub ipv4_only: bool,
     pub max_pending_incoming_handshake_checks: usize,
+    pub reuseport: bool,
 }
 
 impl Default for ListenerOptions {
@@ -70,6 +71,7 @@ impl Default for ListenerOptions {
             announce_port: None,
             ipv4_only: false,
             max_pending_incoming_handshake_checks: DEFAULT_MAX_PENDING_INCOMING_HANDSHAKE_CHECKS,
+            reuseport: false,
         }
     }
 }
@@ -102,7 +104,7 @@ impl ListenerOptions {
                 listen_addr,
                 BindOpts {
                     request_dualstack: !self.ipv4_only,
-                    reuseport: false,
+                    reuseport: self.reuseport,
                     device: bind_device,
                 },
             )

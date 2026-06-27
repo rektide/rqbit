@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use crate::instances::ForwardHandler;
 use crate::{
     ApiError, CreateTorrentOptions, FileInfos, ManagedTorrent, ManagedTorrentShared,
     api::TorrentIdOrHash,
@@ -151,6 +152,7 @@ pub struct Session {
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
     client_name_and_version: String,
+    pub(crate) coordinator: Option<Arc<crate::instances::InstanceCoordinator>>,
 }
 
 async fn torrent_from_url(
@@ -479,6 +481,11 @@ pub struct SessionOptions {
     /// Override the client name and version used in User-Agent headers and
     /// peer extended handshakes. Defaults to "rqbit X.Y.Z".
     pub client_name_and_version: Option<String>,
+
+    /// Instance coordinator for multi-instance SO_REUSEPORT mode.
+    /// When set, the session will announce torrents to peer instances
+    /// and forward incoming connections for torrents it doesn't own.
+    pub instance_coordinator: Option<Arc<crate::instances::InstanceCoordinator>>,
 }
 
 impl Default for SessionOptions {
@@ -507,6 +514,7 @@ impl Default for SessionOptions {
             disable_local_service_discovery: false,
             ipv4_only: false,
             client_name_and_version: None,
+            instance_coordinator: None,
         }
     }
 }
@@ -544,6 +552,39 @@ struct InternalAddResult {
     metadata: Option<TorrentMetadata>,
     trackers: Vec<url::Url>,
     name: Option<String>,
+}
+
+struct SessionForwardHandler {
+    session: std::sync::Weak<Session>,
+}
+
+#[async_trait::async_trait]
+impl ForwardHandler for SessionForwardHandler {
+    async fn handle_forwarded(
+        &self,
+        peer_addr: SocketAddr,
+        reader: crate::type_aliases::BoxAsyncReadVectored,
+        writer: crate::type_aliases::BoxAsyncWrite,
+    ) {
+        let Some(session) = self.session.upgrade() else {
+            debug!("session dropped, cannot handle forwarded connection");
+            return;
+        };
+        match session
+            .clone()
+            .check_incoming_connection(peer_addr, ConnectionKind::Tcp, reader, writer, false)
+            .await
+        {
+            Ok((live, checked)) => {
+                if let Err(e) = live.add_incoming_peer(checked) {
+                    warn!(error=%e, "error adding forwarded peer");
+                }
+            }
+            Err(e) => {
+                debug!(error=%e, %peer_addr, "forwarded connection rejected");
+            }
+        }
+    }
 }
 
 impl Session {
@@ -812,7 +853,14 @@ impl Session {
                 blocklist,
                 allowlist,
                 lsd,
+                coordinator: opts.instance_coordinator,
             });
+
+            if let Some(ref coord) = session.coordinator {
+                coord.set_forward_handler(Arc::new(SessionForwardHandler {
+                    session: Arc::downgrade(&session),
+                }));
+            }
 
             if let Some(mut listen) = listen_result {
                 if let Some(tcp) = listen.tcp_socket.take() {
@@ -907,6 +955,7 @@ impl Session {
         kind: ConnectionKind,
         mut reader: BoxAsyncReadVectored,
         writer: BoxAsyncWrite,
+        allow_forward: bool,
     ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
         let rwtimeout = self
             .peer_opts
@@ -940,14 +989,37 @@ impl Session {
             bail!("seems like we are connecting to ourselves, ignoring");
         }
 
-        let (id, torrent) = self
+        let found = self
             .db
             .read()
             .torrents
             .iter()
             .find(|(_, t)| t.info_hash() == h.info_hash)
-            .map(|(id, t)| (*id, t.clone()))
-            .with_context(|| format!("didn't find a matching torrent {:?}", h.info_hash))?;
+            .map(|(id, t)| (*id, t.clone()));
+
+        let (id, torrent) = match found {
+            Some(found) => found,
+            None => {
+                if allow_forward
+                    && let Some(coord) = &self.coordinator
+                    && let Some(instance_id) = coord.lookup(&h.info_hash.0)
+                {
+                    let mut hs_bytes = [0u8; 68];
+                    let _ = h.serialize_unchecked_len(&mut hs_bytes);
+                    let extra = read_buf.drain_remaining();
+                    coord
+                        .forward_tcp_stream(&instance_id, addr, &hs_bytes, &extra, reader, writer)
+                        .await?;
+                    debug!(
+                        info_hash = ?h.info_hash,
+                        %instance_id,
+                        "forwarded connection to peer instance"
+                    );
+                    bail!("forwarded to instance {instance_id}");
+                }
+                bail!("didn't find a matching torrent {:?}", h.info_hash);
+            }
+        };
 
         let live = torrent
             .live_wait_initializing(Duration::from_secs(5))
@@ -985,7 +1057,7 @@ impl Session {
                             let session = session.upgrade().context("session is dead")?;
                             let span = debug_span!(parent: session.rs(), "incoming", addr=%addr);
                             futs.push(
-                                session.check_incoming_connection(addr, A::KIND, Box::new(read), Box::new(write))
+                                session.check_incoming_connection(addr, A::KIND, Box::new(read), Box::new(write), true)
                                     .map_err(|e| {
                                         debug!("error checking incoming connection: {e:#}");
                                         e
@@ -1400,6 +1472,10 @@ impl Session {
             .start(peer_rx, opts.paused)
             .context("error starting torrent")?;
 
+        if let Some(coord) = &self.coordinator {
+            coord.announce_torrent(&managed_torrent.info_hash().0);
+        }
+
         if let Some(name) = metadata.info.name() {
             info!(?name, "added torrent");
         }
@@ -1443,6 +1519,10 @@ impl Session {
             .torrents
             .remove(&id)
             .with_context(|| format!("torrent with id {id} did not exist"))?;
+
+        if let Some(coord) = &self.coordinator {
+            coord.unannounce_torrent(&removed.info_hash().0);
+        }
 
         if let Err(e) = removed.pause() {
             debug!("error pausing torrent before deletion: {e:#}")
