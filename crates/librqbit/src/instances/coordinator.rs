@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 use crate::instances::protocol::{
-    self, ControlMessage, ForwardTcpMeta, MODE_CONTROL, MODE_FORWARD_TCP,
+    self, ControlMessage, ForwardTcpMeta, MODE_CONTROL, MODE_FORWARD_TCP, WireCodec,
+    default_inbound_codecs, default_outbound_codec, probe_decode_control,
 };
 use crate::instances::routing::RoutingTable;
 use crate::instances::{ForwardHandler, InstanceId};
@@ -36,6 +37,8 @@ pub struct InstanceCoordinator {
     forward_handler: RwLock<Option<Arc<dyn ForwardHandler>>>,
     cancellation: CancellationToken,
     local_torrents: RwLock<Vec<[u8; 20]>>,
+    inbound_codecs: Vec<Box<dyn WireCodec>>,
+    outbound_codec: Box<dyn WireCodec>,
 }
 
 impl InstanceCoordinator {
@@ -74,6 +77,8 @@ impl InstanceCoordinator {
             forward_handler: RwLock::new(None),
             cancellation: CancellationToken::new(),
             local_torrents: RwLock::new(Vec::new()),
+            inbound_codecs: default_inbound_codecs(),
+            outbound_codec: default_outbound_codec(),
         });
 
         coord.spawn_accept_loop(listener);
@@ -84,7 +89,7 @@ impl InstanceCoordinator {
 
     pub fn shutdown(&self) {
         self.cancellation.cancel();
-        let goodbye_payload = protocol::encode_control(&ControlMessage::Goodbye);
+        let goodbye_payload = self.outbound_codec.encode_control(&ControlMessage::Goodbye);
         let mut frame = Vec::new();
         protocol::write_payload_frame(&mut frame, &goodbye_payload);
         let senders: Vec<_> = self
@@ -199,16 +204,18 @@ impl InstanceCoordinator {
 
         let mut buf = Vec::new();
         buf.push(MODE_CONTROL);
-        let hello_payload = protocol::encode_control(&ControlMessage::Hello {
+        let hello_payload = self.outbound_codec.encode_control(&ControlMessage::Hello {
             instance_id: self.instance_id.clone(),
         });
         protocol::write_payload_frame(&mut buf, &hello_payload);
 
         let local_torrents = self.local_torrents.read().clone();
         if !local_torrents.is_empty() {
-            let added_payload = protocol::encode_control(&ControlMessage::TorrentsAdded {
-                info_hashes: local_torrents,
-            });
+            let added_payload =
+                self.outbound_codec
+                    .encode_control(&ControlMessage::TorrentsAdded {
+                        info_hashes: local_torrents,
+                    });
             protocol::write_payload_frame(&mut buf, &added_payload);
         }
 
@@ -239,7 +246,7 @@ impl InstanceCoordinator {
             tracing::debug_span!("peer_read", peer = %peer_id),
             "peer_read",
             coord.cancellation.clone(),
-            coord.peer_reader_task_wrapper(read_half, peer_id),
+            coord.peer_reader_task_wrapper(read_half, peer_id, 0),
         );
 
         debug!(instance_id = %instance_id, "connected to peer instance");
@@ -273,9 +280,11 @@ impl InstanceCoordinator {
         self: Arc<Self>,
         mut stream: tokio::net::unix::OwnedReadHalf,
         peer_id: InstanceId,
+        codec_idx: usize,
     ) {
         use tokio::io::AsyncReadExt;
         let mut len_buf = [0u8; 4];
+        let codec = &self.inbound_codecs[codec_idx];
         loop {
             tokio::select! {
                 biased;
@@ -297,10 +306,14 @@ impl InstanceCoordinator {
                         debug!(peer = %peer_id, error=%e, "error reading frame");
                         break;
                     }
-                    let msg = match protocol::decode_control(&frame) {
-                        Ok(m) => m,
-                        Err(e) => {
+                    let msg = match codec.try_decode_control(&frame) {
+                        Some(Ok(msg)) => msg,
+                        Some(Err(e)) => {
                             warn!(peer = %peer_id, error=%e, "error decoding control message");
+                            break;
+                        }
+                        None => {
+                            warn!(peer = %peer_id, "codec {} returned None for subsequent frame", codec.name());
                             break;
                         }
                     };
@@ -318,8 +331,9 @@ impl InstanceCoordinator {
         self: Arc<Self>,
         stream: tokio::net::unix::OwnedReadHalf,
         peer_id: InstanceId,
+        codec_idx: usize,
     ) -> anyhow::Result<()> {
-        self.peer_reader_task(stream, peer_id).await;
+        self.peer_reader_task(stream, peer_id, codec_idx).await;
         Ok(())
     }
 
@@ -368,7 +382,7 @@ impl InstanceCoordinator {
         let peer = peers
             .get(peer_id)
             .with_context(|| format!("peer {peer_id} not connected"))?;
-        let payload = protocol::encode_control(msg);
+        let payload = self.outbound_codec.encode_control(msg);
         let mut frame = Vec::new();
         protocol::write_payload_frame(&mut frame, &payload);
         peer.sender.send(frame)?;
@@ -376,7 +390,7 @@ impl InstanceCoordinator {
     }
 
     fn broadcast(&self, msg: &ControlMessage) {
-        let payload = protocol::encode_control(msg);
+        let payload = self.outbound_codec.encode_control(msg);
         let mut frame = Vec::new();
         protocol::write_payload_frame(&mut frame, &payload);
         for peer in self.peers.read().values() {
@@ -456,7 +470,7 @@ impl InstanceCoordinator {
         let mut frame = vec![0u8; frame_len];
         stream.read_exact(&mut frame).await?;
 
-        let msg = protocol::decode_control(&frame)?;
+        let (codec_idx, msg) = probe_decode_control(&frame, &self.inbound_codecs)?;
         let ControlMessage::Hello {
             instance_id: peer_id,
         } = msg
@@ -465,16 +479,18 @@ impl InstanceCoordinator {
         };
 
         let mut hello_back = Vec::new();
-        let hello_payload = protocol::encode_control(&ControlMessage::Hello {
+        let hello_payload = self.outbound_codec.encode_control(&ControlMessage::Hello {
             instance_id: self.instance_id.clone(),
         });
         protocol::write_payload_frame(&mut hello_back, &hello_payload);
 
         let torrents = self.local_torrents.read().clone();
         if !torrents.is_empty() {
-            let added_payload = protocol::encode_control(&ControlMessage::TorrentsAdded {
-                info_hashes: torrents,
-            });
+            let added_payload =
+                self.outbound_codec
+                    .encode_control(&ControlMessage::TorrentsAdded {
+                        info_hashes: torrents,
+                    });
             protocol::write_payload_frame(&mut hello_back, &added_payload);
         }
         stream.write_all(&hello_back).await?;
@@ -488,7 +504,7 @@ impl InstanceCoordinator {
             },
         );
 
-        debug!(peer = %peer_id, "incoming control connection established");
+        debug!(peer = %peer_id, codec = %self.inbound_codecs[codec_idx].name(), "incoming control connection established");
         let (read_half, write_half) = stream.into_split();
         let coord = self.clone();
         spawn_with_cancel(
@@ -499,7 +515,7 @@ impl InstanceCoordinator {
                 .clone()
                 .peer_writer_task(write_half, receiver, peer_id.clone()),
         );
-        coord.peer_reader_task(read_half, peer_id).await;
+        coord.peer_reader_task(read_half, peer_id, codec_idx).await;
         Ok(())
     }
 
@@ -565,7 +581,7 @@ impl InstanceCoordinator {
             handshake: handshake_bytes.to_vec(),
             extra: extra_bytes.to_vec(),
         };
-        let meta_payload = protocol::encode_forward(&meta);
+        let meta_payload = self.outbound_codec.encode_forward(&meta);
         let mut meta_frame = Vec::new();
         protocol::write_payload_frame(&mut meta_frame, &meta_payload);
         stream.write_all(&meta_frame).await?;

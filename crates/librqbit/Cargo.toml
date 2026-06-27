@@ -35,7 +35,6 @@ postgres = ["sqlx", "home"]
 async-bt = ["async-backtrace"]
 watch = ["notify"]
 disable-upload = []
-postcard-rpc = ["dep:postcard"]
 
 # These are absolutely useless for people, just for debugging / testing / benchmarking
 _disable_disk_write_net_benchmark = []
@@ -102,7 +101,7 @@ tokio-socks.workspace = true
 async-trait.workspace = true
 async-backtrace = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
-postcard = { workspace = true, optional = true }
+postcard.workspace = true
 walkdir.workspace = true
 arc-swap.workspace = true
 intervaltree.workspace = true
