@@ -17,6 +17,7 @@ use librqbit::{
     PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
     dht::DhtPersistenceConfig,
     http_api::{HttpApi, HttpApiOptions},
+    http_api_client::HttpApiClient,
     librqbit_spawn,
     limits::LimitsConfig,
     storage::{StorageFactory, StorageFactoryExt, filesystem::FilesystemStorageFactory},
@@ -364,6 +365,41 @@ struct DownloadOpts {
     disable_http_api: bool,
 }
 
+#[derive(Parser)]
+struct AddOpts {
+    /// The filename or URL of the torrent. If URL, http/https/magnet are supported.
+    torrent_path: Vec<String>,
+
+    /// The output folder to download to. If not specified, the server's default is used.
+    #[arg(short = 'o', long)]
+    output_folder: Option<String>,
+
+    /// The sub folder within output folder to write to.
+    #[arg(short = 's', long)]
+    sub_folder: Option<String>,
+
+    /// If set, only the file whose filename matching this regex will
+    /// be downloaded
+    #[arg(short = 'r', long = "filename-re")]
+    only_files_matching_regex: Option<String>,
+
+    /// Set if you are ok to write on top of existing files
+    #[arg(long)]
+    overwrite: bool,
+
+    /// A comma-separated list of initial peers
+    #[arg(long = "initial-peers", value_parser = parse_initial_peers)]
+    initial_peers: Option<SocketAddrList>,
+
+    /// The rqbit server URL to connect to.
+    #[arg(
+        long = "server",
+        env = "RQBIT_SERVER_URL",
+        default_value = "http://127.0.0.1:3030"
+    )]
+    server: String,
+}
+
 #[derive(Clone)]
 struct SocketAddrList(Vec<SocketAddr>);
 
@@ -407,6 +443,8 @@ enum SubCommand {
     Share(ShareOpts),
     /// Download a single torrent, stateless.
     Download(DownloadOpts),
+    /// Add a torrent to a running rqbit server.
+    Add(AddOpts),
     /// Shell completions. eval "$(rqbit completions bash)"
     Completions(CompletionsOpts),
 }
@@ -959,6 +997,39 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             println!("share this magnet link: {}", create_result.as_magnet());
 
             http_api_fut.await
+        }
+        SubCommand::Add(add_opts) => {
+            if add_opts.torrent_path.is_empty() {
+                anyhow::bail!("you must provide at least one torrent to add")
+            }
+            let client = HttpApiClient::new(&add_opts.server)
+                .with_context(|| format!("invalid server URL {:?}", add_opts.server))?;
+            client
+                .validate_rqbit_server()
+                .await
+                .context("error connecting to rqbit server")?;
+            for path in &add_opts.torrent_path {
+                let torrent = AddTorrent::from_cli_argument(path)
+                    .with_context(|| format!("failed to parse {path:?}"))?;
+                let opts = AddTorrentOptions {
+                    overwrite: add_opts.overwrite,
+                    only_files_regex: add_opts.only_files_matching_regex.clone(),
+                    output_folder: add_opts.output_folder.clone(),
+                    sub_folder: add_opts.sub_folder.clone(),
+                    initial_peers: add_opts.initial_peers.as_ref().map(|p| p.0.clone()),
+                    ..Default::default()
+                };
+                let response = client
+                    .add_torrent(torrent, Some(opts))
+                    .await
+                    .with_context(|| format!("error adding torrent {path:?}"))?;
+                let id = response.id.unwrap_or(0);
+                match response.details.name {
+                    Some(name) => println!("[{id}] {name}"),
+                    None => println!("[{id}] {}", response.details.info_hash),
+                }
+            }
+            Ok(())
         }
         SubCommand::Completions(_) => unreachable!(),
     }
