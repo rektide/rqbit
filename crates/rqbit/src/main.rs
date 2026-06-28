@@ -383,6 +383,10 @@ struct AddOpts {
     #[arg(short = 'r', long = "filename-re")]
     only_files_matching_regex: Option<String>,
 
+    /// Only list the torrent metadata contents, don't start downloading.
+    #[arg(short, long)]
+    list: bool,
+
     /// Set if you are ok to write on top of existing files
     #[arg(long)]
     overwrite: bool,
@@ -1014,6 +1018,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
                 let opts = AddTorrentOptions {
                     overwrite: add_opts.overwrite,
                     only_files_regex: add_opts.only_files_matching_regex.clone(),
+                    list_only: add_opts.list,
                     output_folder: add_opts.output_folder.clone(),
                     sub_folder: add_opts.sub_folder.clone(),
                     initial_peers: add_opts.initial_peers.as_ref().map(|p| p.0.clone()),
@@ -1023,10 +1028,25 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
                     .add_torrent(torrent, Some(opts))
                     .await
                     .with_context(|| format!("error adding torrent {path:?}"))?;
-                let id = response.id.unwrap_or(0);
-                match response.details.name {
-                    Some(name) => println!("[{id}] {name}"),
-                    None => println!("[{id}] {}", response.details.info_hash),
+                if add_opts.list {
+                    let name = response
+                        .details
+                        .name
+                        .as_deref()
+                        .unwrap_or(&response.details.info_hash);
+                    println!("{name}:");
+                    if let Some(files) = &response.details.files {
+                        for (idx, f) in files.iter().enumerate() {
+                            let suffix = if f.included { "" } else { ", will skip" };
+                            println!("  [{idx}] {:?} ({}{})", f.name, SF::new(f.length), suffix);
+                        }
+                    }
+                } else {
+                    let id = response.id.unwrap_or(0);
+                    match response.details.name {
+                        Some(name) => println!("[{id}] {name}"),
+                        None => println!("[{id}] {}", response.details.info_hash),
+                    }
                 }
             }
             Ok(())
