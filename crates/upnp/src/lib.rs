@@ -246,6 +246,13 @@ impl UpnpEndpoint {
 
     fn get_wan_ip_control_urls(&self) -> impl Iterator<Item = (tracing::Span, Url)> + '_ {
         self.iter_services()
+            .inspect(|(_, s)| {
+                debug!(
+                    service_type = %s.service_type,
+                    control_url = %s.control_url,
+                    "considering service"
+                );
+            })
             .filter(|(_, s)| s.service_type == SERVICE_TYPE_WAN_IP_CONNECTION)
             .map(|(span, s)| (span, self.discover_response.location.join(&s.control_url)))
             .filter_map(|(span, url)| match url {
@@ -264,8 +271,15 @@ pub struct UpnpDiscoverResponse {
     pub location: Url,
 }
 
+const ROOT_DESC_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub async fn discover_services(location: Url) -> anyhow::Result<RootDesc> {
-    let response = Client::new()
+    debug!("fetching rootDesc from {location}");
+    let client = Client::builder()
+        .timeout(ROOT_DESC_FETCH_TIMEOUT)
+        .build()
+        .context("failed to build reqwest client")?;
+    let response = client
         .get(location.clone())
         .send()
         .await
@@ -279,6 +293,11 @@ pub async fn discover_services(location: Url) -> anyhow::Result<RootDesc> {
         .inspect_err(|e| {
             debug!("failed to parse this XML: {response}. Error: {e:#}");
         })?;
+    debug!(
+        location = %location,
+        device_count = root_desc.devices.len(),
+        "fetched and parsed rootDesc"
+    );
     Ok(root_desc)
 }
 
@@ -408,9 +427,19 @@ impl UpnpPortForwarder {
         &self,
         discover_response: UpnpDiscoverResponse,
     ) -> anyhow::Result<UpnpEndpoint> {
+        debug!(
+            location = %discover_response.location,
+            received_from = %discover_response.received_from,
+            "parsing UPnP endpoint"
+        );
         let services = discover_services(discover_response.location.clone()).await?;
         let nics = network_interface::NetworkInterface::show()
             .context("error listing network interfaces")?;
+        debug!(
+            location = %discover_response.location,
+            nic_count = nics.len(),
+            "parsed endpoint, fetched services and NIC list"
+        );
         Ok(UpnpEndpoint {
             discover_response,
             data: services,
@@ -482,6 +511,11 @@ impl UpnpPortForwarder {
                 _ = &mut discovery => {},
                 r = discover_rx.recv() => {
                     let r = r.unwrap();
+                    debug!(
+                        location = %r.location,
+                        received_from = %r.received_from,
+                        "received SSDP discovery response"
+                    );
                     let location = r.location.clone();
                     endpoints.push(self.parse_endpoint(r).map_err(|e| {
                         debug!("error parsing endpoint: {e:#}");
@@ -489,8 +523,21 @@ impl UpnpPortForwarder {
                     }).instrument(debug_span!("parse endpoint", location=location.to_string())));
                 },
                 Some(Ok(endpoint)) = endpoints.next(), if !endpoints.is_empty() => {
+                    let control_urls: Vec<_> = endpoint.get_wan_ip_control_urls().collect();
+                    debug!(
+                        location = %endpoint.location(),
+                        count = control_urls.len(),
+                        "found WANIPConnection control URLs"
+                    );
+                    if control_urls.is_empty() {
+                        debug!(
+                            location = %endpoint.location(),
+                            wanted_service_type = SERVICE_TYPE_WAN_IP_CONNECTION,
+                            "no WANIPConnection services matched this endpoint; not forwarding"
+                        );
+                    }
                     let mut local_ip = None;
-                    for (span, control_url) in endpoint.get_wan_ip_control_urls() {
+                    for (span, control_url) in control_urls {
                         if spawned_tasks.contains(&control_url) {
                             debug!("already spawned for {}", control_url);
                             continue;
@@ -500,6 +547,7 @@ impl UpnpPortForwarder {
                             None => {
                                 match endpoint.my_local_ip() {
                                     Ok(ip) => {
+                                        debug!(%ip, "determined local IP for port mapping");
                                         local_ip = Some(ip);
                                         ip
                                     },
@@ -510,6 +558,7 @@ impl UpnpPortForwarder {
                                 }
                             }
                         };
+                        debug!(%control_url, %ip, "spawning port manager");
                         spawned_tasks.insert(control_url.clone());
                         service_managers.push(self.manage_service(control_url, ip).instrument(span))
                     }
