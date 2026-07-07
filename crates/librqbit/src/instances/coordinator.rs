@@ -13,11 +13,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 use crate::instances::protocol::{
-    self, ControlMessage, ForwardTcpMeta, MODE_CONTROL, MODE_FORWARD_TCP, WireCodec,
-    default_inbound_codecs, default_outbound_codec, probe_decode_control,
+    self, ControlMessage, ForwardTcpFdMeta, ForwardTcpMeta, MODE_CONTROL, MODE_FORWARD_TCP,
+    MODE_FORWARD_TCP_FD, WireCodec, default_inbound_codecs, default_outbound_codec,
+    probe_decode_control,
 };
 use crate::instances::routing::RoutingTable;
-use crate::instances::{ForwardHandler, InstanceId};
+use crate::instances::{ForwardHandler, ForwardMode, InstanceId};
 use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};
 use crate::vectored_traits::AsyncReadVectoredIntoCompat;
 
@@ -41,6 +42,7 @@ pub struct InstanceCoordinator {
     local_torrents: RwLock<Vec<[u8; 20]>>,
     inbound_codecs: Vec<Box<dyn WireCodec>>,
     outbound_codec: Box<dyn WireCodec>,
+    forward_mode: RwLock<ForwardMode>,
 }
 
 impl InstanceCoordinator {
@@ -54,6 +56,16 @@ impl InstanceCoordinator {
 
     pub fn set_forward_handler(&self, handler: Arc<dyn ForwardHandler>) {
         *self.forward_handler.write() = Some(handler);
+    }
+
+    /// Current outgoing-forward strategy (fd-pass vs stream-proxy).
+    pub fn forward_mode(&self) -> ForwardMode {
+        *self.forward_mode.read()
+    }
+
+    /// Set the outgoing-forward strategy. Receiver is always mode-agnostic.
+    pub fn set_forward_mode(&self, mode: ForwardMode) {
+        *self.forward_mode.write() = mode;
     }
 
     pub async fn start() -> anyhow::Result<Arc<Self>> {
@@ -81,6 +93,7 @@ impl InstanceCoordinator {
             local_torrents: RwLock::new(Vec::new()),
             inbound_codecs: default_inbound_codecs(),
             outbound_codec: default_outbound_codec(),
+            forward_mode: RwLock::new(ForwardMode::default()),
         });
 
         coord.spawn_accept_loop(listener);
@@ -515,6 +528,7 @@ impl InstanceCoordinator {
                 self.handle_incoming_forward(stream).await;
                 Ok(())
             }
+            MODE_FORWARD_TCP_FD => self.handle_incoming_forward_fd(stream).await,
             other => {
                 warn!(mode = other, "unknown connection mode");
                 Ok(())
@@ -670,6 +684,158 @@ impl InstanceCoordinator {
             }
         }
         let _ = unix_write.shutdown().await;
+        Ok(())
+    }
+
+    /// Forward a TCP connection to a peer instance by passing the raw fd via
+    /// SCM_RIGHTS. The sender never reads from the stream; bytes stay in the
+    /// kernel buffer and the receiver reads them fresh.
+    ///
+    /// Borrows the TcpStream so the caller can fall back to stream-proxy if
+    /// fd-pass fails. On success, the caller must drop the stream promptly:
+    /// the kernel has dup'd the fd to the receiver, and our local reference
+    /// is redundant.
+    pub async fn forward_tcp_fd(
+        &self,
+        instance_id: &str,
+        peer_addr: std::net::SocketAddr,
+        tcp: &tokio::net::TcpStream,
+    ) -> anyhow::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        use tokio::io::AsyncWriteExt;
+
+        let socket_path = {
+            let peers = self.peers.read();
+            let peer = peers
+                .get(instance_id)
+                .with_context(|| format!("peer {instance_id} not connected"))?;
+            peer.socket_path.clone()
+        };
+
+        let mut unix = UnixStream::connect(&socket_path).await?;
+
+        // 1. Mode byte + metadata frame via standard async write.
+        let meta = ForwardTcpFdMeta { peer_addr };
+        let meta_payload = self.outbound_codec.encode_forward_fd(&meta);
+        let mut buf = Vec::with_capacity(1 + 4 + meta_payload.len());
+        buf.push(MODE_FORWARD_TCP_FD);
+        protocol::write_payload_frame(&mut buf, &meta_payload);
+        unix.write_all(&buf).await?;
+
+        // 2. sendmsg with SCM_RIGHTS — one syscall, readiness-polled via tokio.
+        //    Sentinel byte forces at least one iov entry (some kernels reject
+        //    empty-iov sendmsg); receiver discards it.
+        let unix_fd = unix.as_raw_fd();
+        let tcp_fd = tcp.as_raw_fd();
+        let sentinel = [0u8];
+        let iov = [std::io::IoSlice::new(&sentinel)];
+        let cmsgs = [nix::sys::socket::ControlMessage::ScmRights(&[tcp_fd])];
+
+        loop {
+            unix.writable().await?;
+            match nix::sys::socket::sendmsg::<()>(
+                unix_fd,
+                &iov,
+                &cmsgs,
+                nix::sys::socket::MsgFlags::empty(),
+                None,
+            ) {
+                Ok(_) => break,
+                Err(nix::errno::Errno::EAGAIN) => continue,
+                Err(e) => return Err(anyhow::Error::new(e).context("sendmsg SCM_RIGHTS")),
+            }
+        }
+
+        debug!(
+            target_instance = instance_id,
+            ?peer_addr,
+            "forwarded TCP fd via SCM_RIGHTS"
+        );
+        // Drop the Unix socket: closes our end of the control connection. The
+        // receiver has already received the SCM_RIGHTS message and its own fd
+        // reference is independent of ours.
+        drop(unix);
+        Ok(())
+    }
+
+    /// Receiver side of fd-pass forwarding: read metadata, recvmsg to collect
+    /// the SCM_RIGHTS fd, wrap as tokio TcpStream, hand off to ForwardHandler.
+    /// The BT handshake is still in the kernel buffer; the handler reads it
+    /// fresh via `check_incoming_connection` — no PrefixedReader needed.
+    async fn handle_incoming_forward_fd(
+        self: Arc<Self>,
+        mut stream: UnixStream,
+    ) -> anyhow::Result<()> {
+        use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+
+        let meta = match protocol::read_forward_fd_metadata(&mut stream).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error=%e, "error reading forward-fd metadata");
+                return Ok(());
+            }
+        };
+
+        // recvmsg with cmsg buffer to collect the SCM_RIGHTS fd.
+        let unix_fd = stream.as_raw_fd();
+        let mut cmsg_buf = nix::cmsg_space!(RawFd);
+        let mut sentinel = [0u8; 1];
+
+        let tcp_fd: RawFd = loop {
+            stream.readable().await?;
+            let mut iov = [std::io::IoSliceMut::new(&mut sentinel)];
+            match nix::sys::socket::recvmsg::<()>(
+                unix_fd,
+                &mut iov,
+                Some(&mut cmsg_buf),
+                nix::sys::socket::MsgFlags::empty(),
+            ) {
+                Ok(msg) => {
+                    let found = msg.cmsgs()?.find_map(|cmsg| match cmsg {
+                        nix::sys::socket::ControlMessageOwned::ScmRights(fds) => {
+                            fds.first().copied()
+                        }
+                        _ => None,
+                    });
+                    match found {
+                        Some(fd) => break fd,
+                        None => bail!("forward-fd message arrived without SCM_RIGHTS"),
+                    }
+                }
+                Err(nix::errno::Errno::EAGAIN) => continue,
+                Err(e) => return Err(anyhow::Error::new(e).context("recvmsg SCM_RIGHTS")),
+            }
+        };
+
+        debug!(
+            peer_addr = ?meta.peer_addr,
+            fd = tcp_fd,
+            "received forwarded TCP fd via SCM_RIGHTS"
+        );
+
+        // fd → tokio TcpStream. The fd was created by the kernel during
+        // SCM_RIGHTS handoff; it points to a valid TCP socket. O_NONBLOCK is
+        // inherited from the sender, but we set it explicitly to be safe.
+        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(tcp_fd) };
+        std_stream.set_nonblocking(true)?;
+        let tokio_stream = tokio::net::TcpStream::from_std(std_stream)
+            .context("wrapping received fd as tokio TcpStream")?;
+        let (read_half, write_half) = tokio_stream.into_split();
+
+        let handler = self.forward_handler.read().clone();
+        let Some(handler) = handler else {
+            warn!("forward-fd received but no handler registered");
+            return Ok(());
+        };
+
+        handler
+            .handle_forwarded(
+                meta.peer_addr,
+                Box::new(read_half) as BoxAsyncReadVectored,
+                Box::new(write_half) as BoxAsyncWrite,
+            )
+            .await;
+
         Ok(())
     }
 }

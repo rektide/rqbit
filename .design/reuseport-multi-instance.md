@@ -464,12 +464,163 @@ handshake (e.g., bitfield message in the same TCP segment). They're sent as the
 
 ### Stream Proxy vs FD Passing (ticket: rqbit-reuseport-fd-handoff)
 
-The current stream proxy adds one localhost hop per forwarded connection: data
-flows through the forwarder's Unix socket pipe. An `SCM_RIGHTS` fd-passing
-implementation would hand the raw TCP fd to the owning instance, which then
-reads/writes directly to the peer — zero proxy overhead. This requires
-refactoring the accept loop to provide raw fd access before the stream is boxed
-into trait objects.
+The current implementation supports **both** forwarding mechanisms side-by-side:
+
+| Mode byte | Path | Status |
+|-----------|------|--------|
+| `0x02` MODE_FORWARD_TCP | Stream proxy via bidirectional `tokio::io::copy` through the forwarder's Unix socket | Original implementation; always available |
+| `0x03` MODE_FORWARD_TCP_FD | SCM_RIGHTS fd passing; raw TCP fd handed to owning instance, forwarder bows out | Implemented for TCP only; uTP falls back to stream proxy |
+
+The receiver always dispatches on the mode byte, so any instance accepts both
+modes regardless of its own preference. The sender picks via
+`InstanceCoordinator::forward_mode()` (runtime, default `FdPass`); the choice
+only affects outgoing forwards.
+
+#### FD Passing Flow (Sender Side)
+
+When `forward_mode == FdPass` and the TCP accept loop peeks a BT handshake
+whose info_hash routes to a peer instance, the sender hands the raw TCP fd to
+the owning instance via SCM_RIGHTS ancillary data:
+
+```mermaid
+sequenceDiagram
+    participant P as Peer
+    participant K as Kernel (SO_REUSEPORT)
+    participant B as Instance B (TCP listener)
+    participant R as Routing Table
+    participant U as Unix Socket
+    participant A as Instance A (owner)
+
+    P->>K: TCP connect, handshake has info_hash X
+    K->>B: accept() — delivered to B by hash
+    B->>B: peek (MSG_PEEK) 68-byte handshake
+    B->>R: lookup(X) → instance A
+    B->>U: connect to A's .sock
+    B->>U: write MODE_FORWARD_TCP_FD + ForwardTcpFdMeta
+    B->>U: sendmsg with SCM_RIGHTS([tcp_fd])
+    Note over B: Bytes still in kernel buffer;<br/>B never consumed them
+    B->>B: drop TcpStream (closes our fd ref)
+    Note over A: Kernel has dup'd the fd into A's table
+```
+
+The TCP stream is **never split or boxed** on the sender side. The
+`task_listener_tcp` accept loop (session.rs) calls `peek_bt_handshake()` to
+read the BT handshake via `MSG_PEEK` (non-consuming), looks up the route, and
+either:
+
+1. **ForwardFd route:** `coord.forward_tcp_fd(&instance_id, addr, &stream)`.
+   On success, drops the stream (the receiver has its own fd). On failure,
+   falls through to the Default route.
+2. **Default route:** splits into `OwnedReadHalf`/`OwnedWriteHalf`, boxes,
+   feeds into `check_incoming_connection(allow_forward=true)` — same as the
+   pre-fd-pass code path. This handles local torrents, stream-proxy fallback,
+   and uTP.
+
+#### FD Passing Flow (Receiver Side)
+
+`handle_incoming_forward_fd` (coordinator.rs) reads the metadata frame via
+async `read_exact`, then `recvmsg` with a cmsg buffer sized via
+`nix::cmsg_space!(RawFd)` to collect the SCM_RIGHTS payload:
+
+```mermaid
+sequenceDiagram
+    participant B as Instance B (forwarder)
+    participant U as Instance A Unix Listener
+    participant H as handle_incoming_forward_fd
+    participant FH as ForwardHandler
+    participant S as Session A
+
+    B->>U: connect, MODE_FORWARD_TCP_FD
+    B->>U: write metadata frame
+    B->>U: sendmsg with SCM_RIGHTS([tcp_fd])
+    U->>H: accept, spawn task
+    H->>H: read_forward_fd_metadata (peer_addr)
+    H->>H: recvmsg → extract ScmRights fd
+    H->>H: from_raw_fd → set_nonblocking → from_std
+    H->>FH: handle_forwarded(peer_addr, read_half, write_half)
+    FH->>S: check_incoming_connection(addr, TCP, ..., allow_forward=false)
+    Note over S: Reads handshake from kernel buffer<br/>(bytes were never consumed)<br/>No PrefixedReader needed
+    S->>S: local torrent lookup → hit
+    S->>S: add_incoming_peer
+```
+
+The receiver wraps the raw fd via
+`unsafe { TcpStream::from_raw_fd(fd) }` + `set_nonblocking(true)` +
+`tokio::net::TcpStream::from_std()`. The `unsafe` block is isolated to one
+helper call site; it is sound because the kernel created the fd during
+SCM_RIGHTS and we are its sole owner.
+
+#### Why no PrefixedReader for fd-pass
+
+`PrefixedReader` exists in the stream-proxy path because `check_incoming_connection`
+eagerly reads the handshake via `ReadBuf::read_handshake`, consuming it from the
+wire. When forwarding, those bytes have to be replayed.
+
+In the fd-pass path, the sender peeks (not consumes) the handshake to make the
+routing decision. The bytes stay in the kernel buffer. When the receiver wraps
+the fd as a TcpStream and hands it to `check_incoming_connection`, the
+`read_handshake` call reads the bytes fresh from the wire. No replay needed.
+
+#### Why no OwnedWriteHalf Drop hazard
+
+`tokio::net::tcp::OwnedWriteHalf::Drop` calls `shutdown(Write)`, which would
+send a half-close EOF to the peer — breaking the connection immediately after
+handoff. The fd-pass path sidesteps this: the sender never calls `into_split()`
+on the stream. It holds the original `TcpStream`, whose `Drop` only closes the
+fd (no shutdown). After sendmsg, the kernel has dup'd the fd into the
+receiver's process; our local close releases our reference without affecting
+the receiver's fd or the peer's TCP state.
+
+#### tokio / nix integration
+
+Both `sendmsg` (sender) and `recvmsg` (receiver) use nix 0.30
+(`features = ["uio", "socket"]`, already in `Cargo.toml`). The integration
+pattern avoids `spawn_blocking`:
+
+```text
+loop {
+    stream.writable().await?;            // tokio readiness, reuses reactor registration
+    match nix_sendmsg(stream.as_raw_fd(), iov, cmsgs, ...) {
+        Ok(_) => break,
+        Err(EAGAIN) => continue,         // race with another writer; retry
+        Err(e) => return Err(e),
+    }
+}
+```
+
+Same shape for `recvmsg` with `stream.readable().await`. No `AsyncFd`
+double-registration, no thread-pool trip.
+
+#### Control API
+
+`InstanceCoordinator` exposes:
+
+```rust
+pub fn forward_mode(&self) -> ForwardMode;
+pub fn set_forward_mode(&self, mode: ForwardMode);
+```
+
+`ForwardMode::default()` is `FdPass`. To force stream-proxy everywhere:
+
+```rust
+coord.set_forward_mode(ForwardMode::StreamProxy);
+```
+
+The receiver always accepts both mode bytes regardless of this setting.
+
+#### Drop-down Summary
+
+| Aspect | Stream Proxy (`0x02`) | FD Pass (`0x03`) |
+|---|---|---|
+| Bytes path | peer → forwarder → Unix socket → owner | peer → owner (direct) |
+| Tasks per forward | 2 (copy futures) | 0 |
+| Fd overhead per forward | 1 Unix socket pair | 1 duplicated fd in receiver |
+| Forwarder lifetime bound to connection | Yes | No |
+| Works with uTP | Yes | No (falls back to stream proxy) |
+| Requires `unsafe` | No | Yes, isolated to `from_raw_fd` on receiver |
+| Receiver complexity | PrefixedReader replay | None (bytes still in kernel buffer) |
+
+### Stream Proxy (alternate path)
 
 ### uTP (ticket: rqbit-reuseport-utp)
 
