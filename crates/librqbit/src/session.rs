@@ -552,8 +552,9 @@ enum TcpRoute {
     /// Hand off the raw fd to a peer instance via SCM_RIGHTS.
     ForwardFd { instance_id: InstanceId },
     /// Fall through to `check_incoming_connection` (local handling, stream-proxy
-    /// forward, or rejection).
-    Default,
+    /// forward, or rejection). Carries the peeked handshake (if peek succeeded)
+    /// so the downstream read path can skip the redundant deserialize.
+    Default { handshake: Option<Handshake> },
 }
 
 struct InternalAddResult {
@@ -996,9 +997,37 @@ impl Session {
         self: Arc<Self>,
         addr: SocketAddr,
         kind: ConnectionKind,
+        reader: BoxAsyncReadVectored,
+        writer: BoxAsyncWrite,
+        allow_forward: bool,
+    ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
+        self.check_incoming_connection_with_handshake(
+            addr,
+            kind,
+            reader,
+            writer,
+            allow_forward,
+            None,
+        )
+        .await
+    }
+
+    /// Same as `check_incoming_connection`, but the caller may supply a
+    /// pre-parsed handshake obtained via `peek_bt_handshake`. When supplied,
+    /// the `read_handshake_unparsed` path is used: the same single read fills
+    /// the buffer (so extra bytes past the handshake land in `read_buf` for
+    /// subsequent `read_message` calls) but skips the deserialize step.
+    ///
+    /// Used by `handle_incoming_tcp`'s Default route to avoid parsing the
+    /// 68-byte handshake twice (once in peek, once in the regular read path).
+    async fn check_incoming_connection_with_handshake(
+        self: Arc<Self>,
+        addr: SocketAddr,
+        kind: ConnectionKind,
         mut reader: BoxAsyncReadVectored,
         writer: BoxAsyncWrite,
         allow_forward: bool,
+        peeked_handshake: Option<Handshake>,
     ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
         let rwtimeout = self
             .peer_opts
@@ -1022,10 +1051,19 @@ impl Session {
         }
 
         let mut read_buf = ReadBuf::new();
-        let h = read_buf
-            .read_handshake(&mut reader, rwtimeout)
-            .await
-            .context("error reading handshake")?;
+        let h = match peeked_handshake {
+            Some(h) => {
+                read_buf
+                    .read_handshake_unparsed(&mut reader, rwtimeout)
+                    .await
+                    .context("error reading handshake bytes")?;
+                h
+            }
+            None => read_buf
+                .read_handshake(&mut reader, rwtimeout)
+                .await
+                .context("error reading handshake")?,
+        };
         trace!("received handshake from {addr}: {:?}", h);
 
         if h.peer_id == self.peer_id {
@@ -1254,13 +1292,16 @@ impl Session {
                         "fd-pass failed; falling back to check_incoming_connection"
                     );
                     let (read, write) = stream.into_split();
+                    // No peeked handshake here — the stream may have been
+                    // touched by forward_tcp_fd. Re-read + re-parse normally.
                     return self
-                        .check_incoming_connection(
+                        .check_incoming_connection_with_handshake(
                             addr,
                             ConnectionKind::Tcp,
                             Box::new(read),
                             Box::new(write),
                             true,
+                            None,
                         )
                         .await
                         .map(|_| ());
@@ -1269,15 +1310,16 @@ impl Session {
                 drop(stream);
                 Ok(())
             }
-            TcpRoute::Default => {
+            TcpRoute::Default { handshake } => {
                 let (read, write) = stream.into_split();
                 match self
-                    .check_incoming_connection(
+                    .check_incoming_connection_with_handshake(
                         addr,
                         ConnectionKind::Tcp,
                         Box::new(read),
                         Box::new(write),
                         true,
+                        handshake,
                     )
                     .await
                 {
@@ -1313,22 +1355,30 @@ impl Session {
             Ok(h) => h,
             Err(e) => {
                 trace!(error=%e, "peek failed; falling through to read path");
-                return TcpRoute::Default;
+                // No handshake to carry forward — check_incoming_connection
+                // will re-read + re-parse as usual.
+                return TcpRoute::Default { handshake: None };
             }
         };
 
         // Don't bother forwarding if peer_id matches our own.
         if handshake.peer_id == self.peer_id {
-            return TcpRoute::Default;
+            return TcpRoute::Default {
+                handshake: Some(handshake),
+            };
         }
 
         let Some(coord) = self.coordinator.as_ref() else {
-            return TcpRoute::Default;
+            return TcpRoute::Default {
+                handshake: Some(handshake),
+            };
         };
 
         match coord.lookup(&handshake.info_hash.0) {
             Some(instance_id) => TcpRoute::ForwardFd { instance_id },
-            None => TcpRoute::Default,
+            None => TcpRoute::Default {
+                handshake: Some(handshake),
+            },
         }
     }
 

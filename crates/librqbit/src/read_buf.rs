@@ -69,6 +69,45 @@ impl ReadBuf {
         Ok(h)
     }
 
+    /// Read the BT handshake bytes from the wire without parsing them, when
+    /// the caller has already obtained a parsed `Handshake` (e.g. via
+    /// `TcpStream::peek`). Same single-read semantics as `read_handshake`:
+    /// reads up to 32 KB in one go, so any extra bytes the peer sent past the
+    /// handshake land in the buffer for subsequent `read_message` calls.
+    ///
+    /// After this returns, the buffer is positioned just past the 68-byte
+    /// handshake (i.e. `len` reflects extra bytes only).
+    pub async fn read_handshake_unparsed(
+        &mut self,
+        conn: &mut BoxAsyncReadVectored,
+        timeout: Duration,
+    ) -> Result<()> {
+        self.len = with_timeout(
+            "reading",
+            timeout,
+            conn.read(&mut *self.buf).map_err(Error::ReadHandshake),
+        )
+        .await?;
+        if self.len == 0 {
+            return Err(Error::PeerDisconnectedReadingHandshake);
+        }
+        // The BT handshake is exactly 68 bytes (1 pstrlen + 19 pstr + 8
+        // reserved + 20 info_hash + 20 peer_id). If the first read returned
+        // fewer, this is the same error read_handshake would surface via
+        // Handshake::deserialize.
+        const HANDSHAKE_LEN: usize = 68;
+        if self.len < HANDSHAKE_LEN {
+            return Err(Error::DeserializeHandshake(
+                peer_binary_protocol::MessageDeserializeError::NotEnoughData(
+                    HANDSHAKE_LEN - self.len,
+                    None,
+                ),
+            ));
+        }
+        self.advance(HANDSHAKE_LEN);
+        Ok(())
+    }
+
     fn is_contiguous(&self) -> bool {
         self.start + self.len == (self.start + self.len) % BUFLEN
     }
