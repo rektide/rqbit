@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use crate::instances::{ForwardHandler, ForwardMode, InstanceId};
+use crate::instances::{ForwardHandler, InstanceId};
 use crate::{
     ApiError, CreateTorrentOptions, FileInfos, ManagedTorrent, ManagedTorrentShared,
     api::TorrentIdOrHash,
@@ -1180,31 +1180,64 @@ impl Session {
     /// Per-connection TCP handler. Decides between fd-pass forwarding,
     /// stream-proxy forwarding, and local handling.
     ///
-    /// The decision tree:
-    /// 1. Peek the 68-byte BT handshake (does not consume bytes).
-    /// 2. If the coordinator prefers FdPass *and* the route points to a
-    ///    peer instance: call `coord.forward_tcp_fd(&stream)`. On success,
-    ///    drop the stream (receiver has its own fd via SCM_RIGHTS). On
-    ///    failure, fall through.
-    /// 3. Otherwise: split the stream into OwnedRead/Write halves and feed
-    ///    into `check_incoming_connection(allow_forward=true)`. That function
+    /// Decision flow:
+    /// 1. **Early-exit:** if the coordinator can't forward via fd-pass
+    ///    (none set, FdPass disabled, or no peer instances connected), skip
+    ///    the peek entirely. Single cheap shared-lock check; in the common
+    ///    single-instance deployment this fires on every connection and the
+    ///    per-connection overhead is identical to the pre-fd-pass code path.
+    /// 2. Otherwise: peek the 68-byte BT handshake (does not consume bytes)
+    ///    and look up the route. If the route points to a peer instance,
+    ///    call `coord.forward_tcp_fd(&stream)`. On success, drop the stream
+    ///    (receiver has its own fd via SCM_RIGHTS). On failure, fall through.
+    /// 3. If the route doesn't point anywhere (local torrent, unknown torrent)
+    ///    *or* fd-pass failed: split the stream and feed into
+    ///    `check_incoming_connection(allow_forward=true)`. That function
     ///    re-reads the handshake from the wire (bytes still in kernel buffer
-    ///    because peek didn't consume) and either handles locally, forwards
-    ///    via stream proxy, or rejects.
+    ///    because peek didn't consume).
     async fn handle_incoming_tcp(
         self: Arc<Self>,
         addr: SocketAddr,
         stream: tokio::net::TcpStream,
     ) -> anyhow::Result<()> {
+        // Tier-1 fast path: no possibility of fd-pass forward. Skip peek.
+        let can_forward = self
+            .coordinator
+            .as_ref()
+            .is_some_and(|c| c.can_forward_fd());
+
+        if !can_forward {
+            let (read, write) = stream.into_split();
+            return match self
+                .check_incoming_connection(
+                    addr,
+                    ConnectionKind::Tcp,
+                    Box::new(read),
+                    Box::new(write),
+                    true,
+                )
+                .await
+            {
+                Ok((live, checked)) => {
+                    if let Err(e) = live.add_incoming_peer(checked) {
+                        warn!(?addr, "error handing over incoming TCP connection: {e:#}");
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+        }
+
+        // FdPass is enabled and at least one peer is connected. We must peek
+        // the handshake to make the routing decision.
         let rwtimeout = self
             .peer_opts
             .read_write_timeout
             .unwrap_or_else(|| Duration::from_secs(10));
 
-        // Phase 1: peek handshake + decide route.
         let route = self
             .clone()
-            .peek_and_decide_tcp_route(&stream, addr, rwtimeout)
+            .peek_and_decide_tcp_route(&stream, rwtimeout)
             .await;
 
         match route {
@@ -1220,7 +1253,6 @@ impl Session {
                         error=%e,
                         "fd-pass failed; falling back to check_incoming_connection"
                     );
-                    // Fall through: split + box + check_incoming_connection.
                     let (read, write) = stream.into_split();
                     return self
                         .check_incoming_connection(
@@ -1262,9 +1294,12 @@ impl Session {
     }
 
     /// Peek the BT handshake from a TCP stream and decide the route.
-    /// Returns `ForwardFd` only if the coordinator is configured for FdPass
-    /// *and* the info_hash resolves to a peer instance. Otherwise `Default`
-    /// (which means: split, box, fall through to check_incoming_connection).
+    /// Returns `ForwardFd` only if the info_hash resolves to a peer instance.
+    ///
+    /// Pre-conditions (caller must verify):
+    /// - `coord.is_some()`
+    /// - `coord.forward_mode() == FdPass`
+    /// - `coord.has_peers()` is true
     ///
     /// If peek fails entirely (timeout, peer disconnected, malformed), we
     /// return `Default` — `check_incoming_connection` will then encounter
@@ -1272,7 +1307,6 @@ impl Session {
     async fn peek_and_decide_tcp_route(
         self: Arc<Self>,
         stream: &tokio::net::TcpStream,
-        _addr: SocketAddr,
         rwtimeout: Duration,
     ) -> TcpRoute {
         let handshake = match peek_bt_handshake(stream, rwtimeout).await {
@@ -1291,10 +1325,6 @@ impl Session {
         let Some(coord) = self.coordinator.as_ref() else {
             return TcpRoute::Default;
         };
-
-        if coord.forward_mode() != ForwardMode::FdPass {
-            return TcpRoute::Default;
-        }
 
         match coord.lookup(&handshake.info_hash.0) {
             Some(instance_id) => TcpRoute::ForwardFd { instance_id },

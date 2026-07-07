@@ -68,6 +68,26 @@ impl InstanceCoordinator {
         *self.forward_mode.write() = mode;
     }
 
+    /// Fast check: are any peer instances currently connected?
+    ///
+    /// Used by `handle_incoming_tcp` to skip the BT handshake peek when no
+    /// forward target exists. Reads the peers map under a shared lock.
+    pub fn has_peers(&self) -> bool {
+        !self.peers.read().is_empty()
+    }
+
+    /// Combined fast check: would the coordinator ever accept a forward via
+    /// fd-pass right now? True only when FdPass is enabled AND at least one
+    /// peer instance is connected AND a routing-table lookup could resolve.
+    ///
+    /// Single cheap shared-lock check that subsumes the three early-exit
+    /// guards in `handle_incoming_tcp`. Returns false if:
+    /// - `forward_mode != FdPass` (no point peeking — we won't fd-pass)
+    /// - `peers.is_empty()` (no forward target — lookup would return None)
+    pub fn can_forward_fd(&self) -> bool {
+        self.forward_mode() == ForwardMode::FdPass && self.has_peers()
+    }
+
     pub async fn start() -> anyhow::Result<Arc<Self>> {
         let instance_id = generate_instance_id();
         let socket_dir = get_socket_dir()?;
