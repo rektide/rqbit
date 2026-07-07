@@ -22,6 +22,7 @@ use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};
 use crate::vectored_traits::AsyncReadVectoredIntoCompat;
 
 const DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const DISCOVERY_FALLBACK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_FRAME_SIZE: usize = 1024 * 1024;
 
 struct PeerHandle {
@@ -183,10 +184,15 @@ impl InstanceCoordinator {
                 };
                 drop(event_tx);
                 let _watcher = watcher;
+                let watcher_alive_at_start = _watcher.is_some();
 
-                let mut interval = tokio::time::interval(DISCOVERY_INTERVAL);
+                let mut interval = tokio::time::interval(if watcher_alive_at_start {
+                    DISCOVERY_INTERVAL
+                } else {
+                    DISCOVERY_FALLBACK_INTERVAL
+                });
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                let mut events_alive = true;
+                let mut events_alive = watcher_alive_at_start;
                 loop {
                     tokio::select! {
                         biased;
@@ -200,8 +206,13 @@ impl InstanceCoordinator {
                                     coord.discover_peers().await;
                                 }
                                 None => {
-                                    warn!("notify watcher stream closed; continuing with poll-only");
+                                    warn!(
+                                        "notify watcher stream closed; falling back to {}s poll",
+                                        DISCOVERY_FALLBACK_INTERVAL.as_secs()
+                                    );
                                     events_alive = false;
+                                    interval = tokio::time::interval(DISCOVERY_FALLBACK_INTERVAL);
+                                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                                 }
                             }
                         }
