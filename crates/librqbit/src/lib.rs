@@ -80,7 +80,6 @@ mod type_aliases;
 #[cfg(all(feature = "http-api", feature = "upnp-serve-adapter"))]
 pub mod upnp_server_adapter;
 mod vectored_traits;
-#[cfg(feature = "watch")]
 pub mod watch;
 
 pub use error::{Error, Result};

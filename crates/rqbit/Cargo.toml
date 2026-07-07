@@ -33,7 +33,6 @@ librqbit = { workspace = true, features = [
     "http-api-client",
     "tracing-subscriber-utils",
     "upnp-serve-adapter",
-    "watch",
 ] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 console-subscriber = { workspace = true, optional = true }

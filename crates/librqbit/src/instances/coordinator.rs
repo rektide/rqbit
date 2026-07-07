@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use librqbit_core::spawn_utils::spawn_with_cancel;
+use notify::Watcher;
 use parking_lot::RwLock;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -20,7 +21,7 @@ use crate::instances::{ForwardHandler, InstanceId};
 use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};
 use crate::vectored_traits::AsyncReadVectoredIntoCompat;
 
-const DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_FRAME_SIZE: usize = 1024 * 1024;
 
 struct PeerHandle {
@@ -142,14 +143,67 @@ impl InstanceCoordinator {
             cancel,
             async move {
                 coord.discover_peers().await;
+
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel::<()>();
+                let watcher: Option<notify::RecommendedWatcher> = {
+                    let event_tx = event_tx.clone();
+                    match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                        let Ok(ev) = res else {
+                            return;
+                        };
+                        if ev
+                            .paths
+                            .iter()
+                            .any(|p| p.extension().is_some_and(|e| e == "sock"))
+                        {
+                            let _ = event_tx.send(());
+                        }
+                    }) {
+                        Ok(mut w) => {
+                            match w.watch(&coord.socket_dir, notify::RecursiveMode::NonRecursive) {
+                                Ok(()) => {
+                                    debug!(dir = ?coord.socket_dir, "watching socket dir for events");
+                                    Some(w)
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        dir = ?coord.socket_dir,
+                                        "failed to watch socket dir; poll fallback only"
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to create notify watcher; poll fallback only");
+                            None
+                        }
+                    }
+                };
+                drop(event_tx);
+                let _watcher = watcher;
+
                 let mut interval = tokio::time::interval(DISCOVERY_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut events_alive = true;
                 loop {
                     tokio::select! {
                         biased;
                         _ = coord.cancellation.cancelled() => break,
                         _ = interval.tick() => {
                             coord.discover_peers().await;
+                        }
+                        msg = event_rx.recv(), if events_alive => {
+                            match msg {
+                                Some(()) => {
+                                    coord.discover_peers().await;
+                                }
+                                None => {
+                                    warn!("notify watcher stream closed; continuing with poll-only");
+                                    events_alive = false;
+                                }
+                            }
                         }
                     }
                 }

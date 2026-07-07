@@ -33,7 +33,6 @@ storage_examples = []
 tracing-subscriber-utils = ["tracing-subscriber"]
 postgres = ["sqlx", "home"]
 async-bt = ["async-backtrace"]
-watch = ["notify"]
 disable-upload = []
 
 # These are absolutely useless for people, just for debugging / testing / benchmarking
@@ -100,7 +99,7 @@ mime_guess.workspace = true
 tokio-socks.workspace = true
 async-trait.workspace = true
 async-backtrace = { workspace = true, optional = true }
-notify = { workspace = true, optional = true }
+notify.workspace = true
 postcard.workspace = true
 walkdir.workspace = true
 arc-swap.workspace = true
